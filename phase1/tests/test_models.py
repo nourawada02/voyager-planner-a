@@ -138,3 +138,52 @@ def test_shared_contract_example_accepted_identically(name: str):
     instance = _load(os.path.join(VALID_DIR, f"{name}.json"))
     obj = model_cls.model_validate(instance)
     assert obj.model_dump(mode="json", exclude_none=True)["schema_version"] == "1.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint Phase 4 D.2A: StreamStage's additive ReAct action-loop values
+# (docs/adr/0015-phase4-checkpoint-d2a-system-a-api.md). Proves the
+# Pydantic mirror itself -- not just the JSON Schema (see
+# contracts/tests/test_stream_event_react_stages.py) -- accepts every new
+# value and round-trips through the canonical schema.
+# ---------------------------------------------------------------------------
+
+NEW_D2A_STAGES = [
+    "run_started", "action_started", "action_completed", "action_failed",
+    "run_completed", "run_degraded", "run_failed", "run_cancelled",
+]
+
+
+@pytest.mark.parametrize("stage", NEW_D2A_STAGES)
+def test_stream_event_accepts_new_react_action_loop_stage(stage: str, schema_registry: Registry):
+    instance = {
+        "schema_version": "1.1.0",
+        "event_id": "55555555-5555-4555-8555-555555555555",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "trace_id": "22222222-2222-4222-8222-222222222222",
+        "sequence": 0,
+        "timestamp": "2026-08-01T12:00:00Z",
+        "stage": stage,
+        "payload": {},
+    }
+    obj = m.StreamEvent.model_validate(instance)
+    assert obj.stage.value == stage
+    dumped = obj.model_dump(mode="json", exclude_none=True)
+    validator = _schema_validator("StreamEvent", schema_registry)
+    errors = list(validator.iter_errors(dumped))
+    assert not errors, [e.message for e in errors]
+
+
+def test_stream_event_still_rejects_an_unknown_stage_value():
+    instance = {
+        "schema_version": "1.1.0",
+        "event_id": "55555555-5555-4555-8555-555555555555",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "trace_id": "22222222-2222-4222-8222-222222222222",
+        "sequence": 0,
+        "timestamp": "2026-08-01T12:00:00Z",
+        "stage": "not_a_real_stage",
+        "payload": {},
+    }
+    with pytest.raises(Exception):
+        m.StreamEvent.model_validate(instance)

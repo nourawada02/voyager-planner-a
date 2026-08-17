@@ -397,6 +397,22 @@ class StreamStage(str, Enum):
     PARTIAL_FAILURE = "partial_failure"
     PLAN_COMPLETED = "plan.completed"
     ERROR = "error"
+    # Checkpoint Phase 4 D.2A additive values (contracts/StreamEvent.schema.json
+    # 1.1.0): the original ten values above describe architecture.md
+    # §5.3's linear pipeline; System A's real shape since Checkpoint D.0
+    # is the bounded ReAct action loop (ADR 0009 §4), which this
+    # checkpoint's public SSE endpoint streams sanitized progress for
+    # instead. Purely additive -- every pre-existing 1.0.0 StreamEvent
+    # instance using only the original ten values remains valid
+    # unchanged (docs/adr/0015-phase4-checkpoint-d2a-system-a-api.md).
+    RUN_STARTED = "run_started"
+    ACTION_STARTED = "action_started"
+    ACTION_COMPLETED = "action_completed"
+    ACTION_FAILED = "action_failed"
+    RUN_COMPLETED = "run_completed"
+    RUN_DEGRADED = "run_degraded"
+    RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
 
 
 class StreamEvent(BaseModel):
