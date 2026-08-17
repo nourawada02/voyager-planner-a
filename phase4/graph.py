@@ -34,7 +34,8 @@ from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
-from phase1.models import FairPriceEstimate, FlightOption, LocalItinerary, ProviderResponseEnvelope, StayOption
+from phase1.models import FlightOption, LocalItinerary, ProviderResponseEnvelope
+from phase4.context import ExecutionContext
 from phase4.guards import check_input, check_output
 from phase4.models import (
     ACTION_ARGUMENT_MODELS,
@@ -97,6 +98,79 @@ def _first_error_field(exc: ValidationError) -> str:
     return str(loc[0]) if loc else "unknown"
 
 
+def _validate_weather_result(result: dict) -> Optional[str]:
+    """Matches the REAL `providers.weather`/`providers.weather_openmeteo`
+    WeatherResult contract: a "kind"-discriminated shape ("current_observation"
+    with a nested `observation.condition`, or "forecast" with
+    `forecast_days[i].condition") -- not a flat {"location","condition"}
+    shape. Checkpoint D.1 audit finding: the original D.0 check only
+    matched this checkpoint's own fake fixture, not the real provider's
+    actual shape; both the fixture (`phase4/tools.py`) and this check
+    were corrected together."""
+    if "location" not in result:
+        return "missing_location"
+    kind = result.get("kind")
+    if kind == "current_observation":
+        observation = result.get("observation")
+        if not isinstance(observation, dict) or "condition" not in observation:
+            return "missing_observation_condition"
+    elif kind == "forecast":
+        days = result.get("forecast_days")
+        if not isinstance(days, list) or not days or "condition" not in days[0]:
+            return "missing_forecast_condition"
+    else:
+        return "missing_or_unknown_kind"
+    return None
+
+
+def _validate_search_stays_result(result: dict) -> Optional[str]:
+    """Matches the REAL Travel MCP `search_stays` result contract
+    (services/travel-mcp/phase2/serving/models.py::SearchStaysResult) --
+    a nested `{"stays": [{"stay": {...}, "fair_price": {...}, "rank": ...}]}`
+    shape, structurally distinct from `phase1.models.StayOption`.
+    Checkpoint D.1 audit finding: the original D.0 check validated a flat
+    `{"options": [StayOption...]}` shape no real MCP response ever
+    actually produces; both the fixture (`phase4/tools.py`) and this
+    check were corrected together."""
+    stays = result.get("stays")
+    if not isinstance(stays, list) or not stays:
+        return "missing_stays"
+    for item in stays:
+        if not isinstance(item, dict):
+            return "malformed_stay_item"
+        stay = item.get("stay")
+        if not isinstance(stay, dict) or "stay_id" not in stay or "nightly_price" not in stay:
+            return "malformed_stay_item"
+        if "fair_price" not in item:
+            return "missing_fair_price"
+    return None
+
+
+def _validate_estimate_fair_price_result(result: dict) -> Optional[str]:
+    """Matches the REAL Travel MCP `estimate_fair_price` result contract
+    (`EstimateFairPriceResult`) -- nested `fair_price.estimated_fair_price`,
+    not the flat `deal_score`/`components` shape D.0's original fixture
+    invented."""
+    if "stay_id" not in result or "fair_price" not in result:
+        return "missing_fair_price_fields"
+    fair_price = result.get("fair_price")
+    if not isinstance(fair_price, dict) or "estimated_fair_price" not in fair_price:
+        return "malformed_fair_price"
+    return None
+
+
+# Checkpoint D.1 audit finding: `ProviderResponseEnvelope` (ADR 0009 §5)
+# is specifically the root `providers/` package's own convention --
+# search_flights/get_weather/web_search results really are wrapped in it.
+# Travel MCP (search_stays/estimate_fair_price) and System B's A2A
+# artifact (call_istanbul_expert) each have their own, different, real
+# result contract and were never wrapped in this envelope at all; the
+# original D.0 validator wrongly required it for every action, which
+# only ever matched this checkpoint's own (also wrong, now corrected)
+# fake fixture shapes, never the real MCP/A2A contracts.
+_ENVELOPE_WRAPPED_ACTIONS = frozenset({Action.SEARCH_FLIGHTS, Action.GET_WEATHER, Action.WEB_SEARCH})
+
+
 def _validate_tool_result(action: Action, candidate: Any) -> Optional[str]:
     """Validates a raw tool result against the reused, unmodified
     `phase1.models` mirrors before it is ever allowed into state.
@@ -104,14 +178,17 @@ def _validate_tool_result(action: Action, candidate: Any) -> Optional[str]:
     otherwise -- never the raw pydantic error text."""
     if not isinstance(candidate, dict):
         return "not_a_dict"
-    try:
-        envelope = ProviderResponseEnvelope.model_validate(candidate)
-    except ValidationError as exc:
-        return f"envelope_invalid:{_first_error_field(exc)}"
 
-    result = envelope.result
-    if not isinstance(result, dict):
-        return "result_not_a_dict"
+    if action in _ENVELOPE_WRAPPED_ACTIONS:
+        try:
+            envelope = ProviderResponseEnvelope.model_validate(candidate)
+        except ValidationError as exc:
+            return f"envelope_invalid:{_first_error_field(exc)}"
+        result = envelope.result
+        if not isinstance(result, dict):
+            return "result_not_a_dict"
+    else:
+        result = candidate
 
     try:
         if action == Action.SEARCH_FLIGHTS:
@@ -121,16 +198,17 @@ def _validate_tool_result(action: Action, candidate: Any) -> Optional[str]:
             for opt in options:
                 FlightOption.model_validate(opt)
         elif action == Action.SEARCH_STAYS:
-            options = result.get("options")
-            if not isinstance(options, list) or not options:
-                return "missing_options"
-            for opt in options:
-                StayOption.model_validate(opt)
+            stays_error = _validate_search_stays_result(result)
+            if stays_error is not None:
+                return stays_error
         elif action == Action.ESTIMATE_FAIR_PRICE:
-            FairPriceEstimate.model_validate(result)
+            price_error = _validate_estimate_fair_price_result(result)
+            if price_error is not None:
+                return price_error
         elif action == Action.GET_WEATHER:
-            if not all(key in result for key in ("location", "condition")):
-                return "missing_weather_fields"
+            weather_error = _validate_weather_result(result)
+            if weather_error is not None:
+                return weather_error
         elif action == Action.WEB_SEARCH:
             if not isinstance(result.get("items"), list):
                 return "missing_web_search_items"
@@ -388,7 +466,15 @@ def _make_execute_node(
                 "pending_raw_tool_result": {"status": "cancelled", "result": None},
             }
 
-        raw = tool_executor.execute(action, arguments)
+        context = ExecutionContext(
+            session_id=state.get("session_id", ""),
+            trace_id=state.get("trace_id", ""),
+            normalized_request=state.get("normalized_request", {}),
+            observations=tuple(state.get("observations", [])),
+            deadline_monotonic=state.get("started_at_monotonic", 0.0) + TOTAL_WORKFLOW_DEADLINE_SECONDS,
+            cancellation_check=cancellation_check,
+        )
+        raw = tool_executor.execute(action, arguments, context)
         tool_call_count = state.get("tool_call_count", 0) + 1
         by_action = dict(state.get("tool_call_count_by_action", {}))
         by_action[action.value] = by_action.get(action.value, 0) + 1
@@ -404,6 +490,30 @@ def _make_execute_node(
 
 
 def _observe_node(state: PlannerState) -> dict[str, Any]:
+    """Checkpoint D.1 transition-reduction change: for a genuine (non-
+    duplicate) tool execution, this one physical LangGraph node performs
+    BOTH the Observe responsibility (validate the raw tool result,
+    fingerprint it) and the Update responsibility (merge the new
+    observation into evidence) -- it routes directly back to Decide,
+    never through the separate "update" node, and records an explicit
+    "Update" trace entry itself so the audit trail still shows both
+    logical stages even though they now share one physical step. The
+    "update" node itself is unchanged and still exists (structurally
+    reachable, still exercised) for the duplicate-skip path (`_decide_node`
+    -> "update" -> Decide), where no real Observe work is needed at all.
+
+    Why: measured against the real production ToolExecutor (Checkpoint
+    D.1 §8 cross-process test), the canonical five-tool-call plan
+    (search_flights, search_stays, estimate_fair_price, get_weather,
+    call_istanbul_expert) needed 26 real LangGraph steps at the previous
+    4-transitions-per-cycle design, one more than the fixed 25-transition
+    ceiling -- so a real, correctly-completing plan would always be
+    misclassified as hitting the recursion-limit backstop. Folding
+    Observe+Update into one step for the common case brings the same
+    five-tool plan down to a real, empirically re-measured, comfortably
+    bounded transition count (docs/adr/0014-...md), without loosening
+    the 25-transition ceiling itself, without touching the 9 declared
+    LangGraph node names, and without changing any other bound."""
     trace = list(state.get("trace", []))
     transitions = state.get("graph_transition_count", 0) + 1
     pending = state["pending_action"]
@@ -435,6 +545,7 @@ def _observe_node(state: PlannerState) -> dict[str, Any]:
     executed_fingerprints = state.get("executed_fingerprints", []) + [fingerprint]
 
     trace.append({"node": "Observe", "action": action.value, "status": status})
+    trace.append({"node": "Update", "status": "merged"})
     return {
         "graph_transition_count": transitions, "trace": trace,
         "observations": observations, "executed_fingerprints": executed_fingerprints,
@@ -567,7 +678,12 @@ def build_graph(
         {"execute": "execute", "update": "update", "synthesize": "synthesize", "degrade": "degrade"},
     )
     graph.add_edge("execute", "observe")
-    graph.add_edge("observe", "update")
+    # "observe" now routes directly back to "decide" -- it performs both
+    # the Observe and Update responsibilities in one physical step for a
+    # genuine (non-duplicate) tool execution (see _observe_node's own
+    # docstring). "update" remains a real, separately reachable node,
+    # used only for the duplicate-skip path below.
+    graph.add_edge("observe", "decide")
     graph.add_edge("update", "decide")
     graph.add_edge("synthesize", "end")
     graph.add_edge("degrade", "end")

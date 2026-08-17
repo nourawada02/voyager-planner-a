@@ -29,14 +29,12 @@ from phase1.models import (
     DataMode,
     DataProvenance,
     DataQuality,
-    DealScoreComponent,
-    FairPriceEstimate,
     FlightOption,
     LocalItinerary,
     Money,
     ProviderResponseEnvelope,
-    StayOption,
 )
+from phase4.context import ExecutionContext
 from phase4.models import Action
 
 FIXED_CLOCK = "2026-08-17T12:00:00Z"
@@ -53,9 +51,19 @@ class ToolExecutor(Protocol):
     node is solely responsible for schema validation before any state
     insertion (this executor never silently pre-validates, since a real
     adapter's own malformed response must be observable the same way a
-    fake's is)."""
+    fake's is).
 
-    def execute(self, action: Action, arguments: dict[str, Any]) -> dict[str, Any]: ...
+    `context` (Checkpoint D.1 additive change) is an optional
+    `phase4.context.ExecutionContext` -- a real binding uses it to map an
+    action like `estimate_fair_price`/`call_istanbul_expert` from
+    already-validated prior observations rather than asking the decision
+    provider to reproduce them. Optional and ignorable: `FakeToolExecutor`
+    (Checkpoint D.0) accepts and ignores it, so no existing hermetic test
+    needed to change."""
+
+    def execute(
+        self, action: Action, arguments: dict[str, Any], context: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]: ...
 
 
 # A fixed, pinned namespace (a random constant, generated once) so
@@ -100,55 +108,142 @@ def _build_search_flights(arguments: dict, now: str) -> dict:
     return _envelope("fake-flight-search-provider", now, "TRY", {"options": [option.model_dump(mode="json")]})
 
 
+def _fake_fair_price_display(stay_id: str) -> dict:
+    # Shape matches the REAL Travel MCP FairPriceDisplay.to_dict() exactly
+    # (services/travel-mcp/phase2/serving/models.py) -- nested
+    # interval/scoring_status/missing_components, never the flat
+    # deal_score/components shape D.0's original fixture invented.
+    return {
+        "schema_version": "1.1.0",
+        "stay_id": stay_id,
+        "estimated_fair_price": {"amount_minor_units": 230000, "currency": "TRY"},
+        "interval": {
+            "lower_minor_units": 200000, "upper_minor_units": 260000, "currency": "TRY",
+            "target_coverage": 0.8, "lower_bound_clamped": False,
+        },
+        "scoring_status": "incomplete",
+        "missing_components": ["itinerary_accessibility"],
+        "incomplete_reason": "itinerary_accessibility is System-B-owned and is never available to a standalone search_stays call.",
+        "model_version": "fake-d0-v1",
+        "baseline_beaten": True,
+        "provenance": {"provider": "fake-fair-price-model", "data_mode": "fixture", "retrieved_at": "2026-08-17T12:00:00Z"},
+    }
+
+
 def _build_search_stays(arguments: dict, now: str) -> dict:
-    option = StayOption(
-        stay_id="stay_fake_d0_001",
-        name="Fake Boutique Hotel",
-        district_id=arguments.get("district_id") or "district_sultanahmet",
-        side="european",
-        coordinates={"lat": 41.0086, "lon": 28.9802},
-        nightly_price=Money(amount_minor_units=250000, currency="TRY"),
-        rating=4.5,
-        review_count=120,
-        amenities=["wifi", "breakfast"],
-        provenance=DataProvenance(provider="fake-accommodation-provider", data_mode=DataMode.FIXTURE, retrieved_at=now, source_urls=[]),
-    )
-    return _envelope("fake-accommodation-provider", now, "TRY", {"options": [option.model_dump(mode="json")]})
+    # Shape matches the REAL Travel MCP SearchStaysResult.to_dict()
+    # exactly (services/travel-mcp/phase2/serving/models.py) -- nested
+    # {"stays": [{"stay": ..., "fair_price": ..., "rank": ...}]}, never
+    # the flat {"options": [StayOption...]} shape D.0's original fixture
+    # invented, which no real MCP response ever actually produces.
+    stay_id = "stay_fake_d0_001"
+    district_id = arguments.get("district_id") or "district_sultanahmet"
+    stay = {
+        "schema_version": "1.1.0",
+        "stay_id": stay_id,
+        "name": "Fake Boutique Hotel",
+        "district_id": district_id,
+        "side": "european",
+        "coordinates": {"lat": 41.0086, "lon": 28.9802},
+        "nightly_price": {"amount_minor_units": 250000, "currency": "TRY"},
+        "amenities": ["wifi", "breakfast"],
+        "provenance": {"provider": "fake-accommodation-provider", "data_mode": "fixture", "retrieved_at": now},
+        "room_type": "Entire home/apt",
+        "property_type": "Apartment",
+        "capacity": {"accommodates": arguments.get("guest_count", 2)},
+        "availability_status": "unknown",
+        "snapshot_date": "2026-06-30",
+        "rating": 4.5,
+        "review_count": 120,
+    }
+    item = {
+        "stay": stay,
+        "fair_price": _fake_fair_price_display(stay_id),
+        "preliminary_capped_price_value": 0.78,
+        "rank": 1,
+    }
+    result = {
+        "schema_version": "1.0.0",
+        "snapshot_date": "2026-06-30",
+        "dataset_sha256": "fake-d0-dataset-sha256",
+        "bundle_sha256": "fake-d0-bundle-sha256",
+        "model_version": "fake-d0-v1",
+        "currency": "TRY",
+        "data_mode": "historical",
+        "disclaimer": "Deterministic Checkpoint D.0 fixture -- never live availability, never a booking.",
+        "predictions_produced": True,
+        "ranking_basis": "preliminary_price_value_desc",
+        "excluded_row_count": 0,
+        "stays": [item],
+    }
+    # NOT wrapped in _envelope(): the real Travel MCP search_stays tool
+    # returns this SearchStaysResult-shaped dict directly -- MCP results
+    # are never ProviderResponseEnvelope-wrapped (that is specifically
+    # the root providers/ package's own convention, ADR 0009 §5).
+    return result
 
 
 def _build_estimate_fair_price(arguments: dict, now: str) -> dict:
-    estimate = FairPriceEstimate(
-        stay_id=arguments["stay_id"],
-        estimated_fair_price=Money(amount_minor_units=230000, currency="TRY"),
-        deal_score=0.72,
-        components={"location": DealScoreComponent(weight=0.5, raw_value=0.8, normalized_value=0.8)},
-        model_version="fake-d0-v1",
-        baseline_beaten=True,
-        provenance=DataProvenance(provider="fake-fair-price-model", data_mode=DataMode.FIXTURE, retrieved_at=now, source_urls=[]),
-    )
-    return _envelope("fake-fair-price-model", now, "TRY", estimate.model_dump(mode="json"))
+    # Shape matches the REAL Travel MCP EstimateFairPriceResult.to_dict()
+    # exactly.
+    stay_id = arguments["stay_id"]
+    result = {
+        "schema_version": "1.0.0",
+        "stay_id": stay_id,
+        "snapshot_date": "2026-06-30",
+        "dataset_sha256": "fake-d0-dataset-sha256",
+        "bundle_sha256": "fake-d0-bundle-sha256",
+        "model_version": "fake-d0-v1",
+        "currency": "TRY",
+        "provenance": {"provider": "fake-fair-price-model", "data_mode": "fixture", "retrieved_at": now},
+        "disclaimer": "Deterministic Checkpoint D.0 fixture -- never live availability, never a booking.",
+        "fair_price": _fake_fair_price_display(stay_id),
+    }
+    # NOT wrapped in _envelope(): matches the real Travel MCP
+    # estimate_fair_price tool's own unwrapped EstimateFairPriceResult shape.
+    return result
 
 
 def _build_get_weather(arguments: dict, now: str) -> dict:
+    # Shape matches the REAL providers.weather_openmeteo WeatherResult
+    # contract exactly (Checkpoint D.1 audit finding: the original D.0
+    # fixture used a flat {"location", "condition"} shape that never
+    # matched the real provider's "kind"-discriminated, nested
+    # observation/forecast_days shape -- both the fixture and Observe's
+    # own validation were fixed together so fake and real data are
+    # accepted by the identical validation path).
+    date_from = str(arguments["date_from"])
     result = {
         "location": arguments.get("location", "Istanbul"),
-        "date_from": str(arguments["date_from"]),
-        "date_to": str(arguments["date_to"]),
-        "condition": "partly_cloudy",
-        "temperature_high_c": 27,
-        "temperature_low_c": 19,
+        "timezone": "Europe/Istanbul",
+        "kind": "forecast",
+        "units": {"temperature": "C", "wind_speed": "kmh", "precipitation": "mm"},
+        "forecast_days": [
+            {"date": date_from, "condition": "partly_cloudy", "high": 27, "low": 19, "precipitation_chance": 0.1},
+        ],
+        "missing_fields": [],
     }
     return _envelope("fake-weather-provider", now, None, result)
 
 
 def _build_web_search(arguments: dict, now: str) -> dict:
+    # Shape matches the REAL providers.web_evidence_serpapi WebEvidenceResult
+    # contract's field names (original_query/normalized_query/items).
+    query_text = arguments["query"]
     result = {
-        "query": arguments["query"],
+        "original_query": query_text,
+        "normalized_query": query_text.strip().lower(),
         "items": [
             {
                 "title": "Hagia Sophia visiting hours",
                 "canonical_url": "https://example-fixture.voyagerai.dev/hagia-sophia",
+                "publisher": "example-fixture.voyagerai.dev",
+                "published_at": None,
+                "retrieved_at": now,
                 "snippet": "Deterministic fake evidence snippet for Checkpoint D.0 -- never a real fetched fact.",
+                "language": "en",
+                "rank": 1,
+                "freshness": "fixture",
                 "source_type": "secondary",
             }
         ],
@@ -187,7 +282,10 @@ def _build_call_istanbul_expert(arguments: dict, now: str) -> dict:
         data_quality=DataQuality(completeness=1.0, freshness=DataMode.FIXTURE, assumptions=[]),
         hard_constraint_validation_passed=True,
     )
-    return _envelope("fake-istanbul-expert", now, None, itinerary.model_dump(mode="json"))
+    # NOT wrapped in _envelope(): the real System B A2A artifact payload
+    # is a LocalItinerary dict directly -- never a ProviderResponseEnvelope
+    # (that convention belongs only to the root providers/ package).
+    return itinerary.model_dump(mode="json")
 
 
 _BUILDERS: dict[Action, Callable[[dict, str], dict]] = {
@@ -211,7 +309,9 @@ class FakeToolExecutor:
     clock: Callable[[], str] = field(default=lambda: FIXED_CLOCK)
     call_log: list[tuple[Action, dict]] = field(default_factory=list)
 
-    def execute(self, action: Action, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self, action: Action, arguments: dict[str, Any], context: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
         self.call_log.append((action, dict(arguments)))
         scenario = self.scenario_by_action.get(action, "success")
         now = self.clock()

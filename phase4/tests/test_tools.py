@@ -66,10 +66,18 @@ def test_every_capability_has_a_success_fixture():
         Action.WEB_SEARCH: {"query": "Hagia Sophia hours"},
         Action.CALL_ISTANBUL_EXPERT: {"question": "What should I see near Sultanahmet?"},
     }
+    # search_stays/estimate_fair_price/call_istanbul_expert are NOT
+    # ProviderResponseEnvelope-wrapped (Travel MCP/System B A2A each have
+    # their own real, unwrapped result contract, ADR 0009 §5) -- only
+    # search_flights/get_weather/web_search carry a top-level "provider" key.
+    unwrapped_actions = {Action.SEARCH_STAYS, Action.ESTIMATE_FAIR_PRICE, Action.CALL_ISTANBUL_EXPERT}
     for action, args in fixtures.items():
         result = executor.execute(action, args)
         assert result["status"] == "success", action
-        assert result["result"]["provider"], action
+        if action in unwrapped_actions:
+            assert isinstance(result["result"], dict) and result["result"], action
+        else:
+            assert result["result"]["provider"], action
 
 
 def test_no_real_socket_is_ever_opened(monkeypatch):
