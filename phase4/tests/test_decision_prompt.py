@@ -16,13 +16,17 @@ import json
 
 import pytest
 
-from phase4.graph import _EXAMPLE_DECISION, _action_argument_contract, _build_decision_prompt
+from phase4.graph import _build_decision_prompt
 from phase4.models import (
     ACTION_ARGUMENT_MODELS,
     Action,
     ActionDecisionValidationError,
+    SPECIALIST_ACTIONS,
+    SUPERVISOR_ACTIONS,
     parse_action_decision,
 )
+from phase4.prompt_contract import action_argument_contract as _action_argument_contract
+from phase4.specialist import _EXAMPLE_DECISION, _build_specialist_prompt
 
 # The literal, previously-observed malformed Qwen response for the
 # BEY/IST live-gate scenario, reconstructed from the sanitized validation
@@ -46,10 +50,35 @@ def _minimal_state() -> dict:
     return {"observations": [], "normalized_request": {"user_message": "Find me a flight."}}
 
 
+def _minimal_specialist_state() -> dict:
+    return {
+        "normalized_request": {"user_message": "Find me a flight.", "trip_request": None},
+        "inherited_observations": [],
+        "specialist_observations": [],
+        "tool_call_count": 0,
+    }
+
+
 def test_generated_prompt_contains_every_canonical_action():
-    system, _ = _build_decision_prompt(_minimal_state())
-    for action in Action:
-        assert action.value in system
+    """Checkpoint Phase 4 D.3: the supervisor and the internal Travel
+    Search specialist each see only their own closed action list
+    (`SUPERVISOR_ACTIONS`/`SPECIALIST_ACTIONS`, a strict partition of
+    every `Action` member) -- never the other loop's tools -- so this
+    checks each prompt against its own scoped list rather than every
+    `Action` against a single prompt."""
+    supervisor_system, _ = _build_decision_prompt(_minimal_state())
+    for action in SUPERVISOR_ACTIONS:
+        assert action.value in supervisor_system
+    for action in SPECIALIST_ACTIONS:
+        assert action.value not in supervisor_system
+
+    specialist_system, _ = _build_specialist_prompt(_minimal_specialist_state())
+    for action in SPECIALIST_ACTIONS:
+        assert action.value in specialist_system
+    for action in SUPERVISOR_ACTIONS:
+        if action == Action.CALL_TRAVEL_SEARCH:
+            continue  # never appears in the specialist's own prompt text
+        assert action.value not in specialist_system
 
 
 def test_search_flights_contract_exposes_exact_canonical_fields():
@@ -61,10 +90,13 @@ def test_search_flights_contract_exposes_exact_canonical_fields():
 
 
 def test_iata_regex_is_represented_in_the_contract_and_prompt():
+    """`search_flights` is a specialist-only action (Checkpoint Phase 4
+    D.3) -- its schema/IATA guidance now lives only in the internal
+    Travel Search specialist's own prompt, never the supervisor's."""
     contract = _action_argument_contract()
     assert contract["search_flights"]["properties"]["origin"]["pattern"] == r"^[A-Z]{3}$"
     assert contract["search_flights"]["properties"]["destination"]["pattern"] == r"^[A-Z]{3}$"
-    system, _ = _build_decision_prompt(_minimal_state())
+    system, _ = _build_specialist_prompt(_minimal_specialist_state())
     assert r"^[A-Z]{3}$" in system
     assert "IATA" in system
 
@@ -157,15 +189,17 @@ def test_no_prompt_or_secret_leaks_into_graph_state_trace_or_checkpoint():
             return response
 
     decider = _Scripted([
+        json.dumps({"action": "call_travel_search", "arguments": {}, "reason_code": "missing_flight_info", "explanation": "Flight information is required."}),
         json.dumps({
             "action": "search_flights",
             "arguments": {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1},
             "reason_code": "missing_flight_info",
             "explanation": "Flight information is required.",
         }),
+        json.dumps({"action": "travel_search_complete", "arguments": {}, "reason_code": "all_required_evidence_present", "explanation": "Done."}),
         json.dumps({"action": "synthesize", "arguments": {}, "reason_code": "all_required_evidence_present", "explanation": "Done."}),
     ])
-    graph = build_graph(FakeToolExecutor(), decider)
+    graph = build_graph(FakeToolExecutor(), decider, decider)
     request = PlannerRequest(session_id=uuid4(), trace_id=uuid4(), user_message="Find me a flight to Istanbul.")
     result = start_session(graph, request, "t-prompt-privacy")
 

@@ -38,6 +38,35 @@ MAX_DECISION_REPAIRS = 2  # malformed-decision-JSON repair attempts
 MAX_CALLS_PER_TOOL = 2  # mirrors providers.policy.RetryPolicy.max_retries's default bound
 TOTAL_WORKFLOW_DEADLINE_SECONDS = 60.0
 
+# Checkpoint Phase 4 D.3 (correction pass): the internal Travel Search
+# specialist is a genuinely separate, compiled LangGraph `StateGraph`
+# (phase4/specialist.py) with its own real transitions -- it needs its
+# own real `recursion_limit`, independent of and strictly tighter than
+# the supervisor's own MAX_GRAPH_TRANSITIONS=25. A 4-node cycle
+# (specialist_decide -> specialist_execute_observe -> specialist_decide
+# -> ... -> specialist_end) costs 2 transitions per tool call, so 15
+# comfortably bounds up to ~7 real specialist tool calls -- already past
+# MAX_SPECIALIST_EXTERNAL_CALLS below, so that external-call cap binds
+# first in practice, exactly mirroring the documented relationship
+# between MAX_GRAPH_TRANSITIONS and MAX_EXTERNAL_TOOL_CALLS at the
+# supervisor level (ADR 0014 §5).
+MAX_SPECIALIST_GRAPH_TRANSITIONS = 15
+# The specialist's own external-tool-call backstop for a single
+# delegation -- independent of, and in addition to, the shared
+# MAX_EXTERNAL_TOOL_CALLS/TOTAL_WORKFLOW_DEADLINE_SECONDS bounds it also
+# obeys (phase4/specialist.py). Never relies on this alone: it is
+# defense in depth against a runaway specialist loop, exactly the same
+# "structural backstop beyond the primary bound" pattern
+# MAX_CONSECUTIVE_DUPLICATES already establishes for the supervisor
+# (phase4/graph.py).
+MAX_SPECIALIST_EXTERNAL_CALLS = 5
+# The specialist's own decision-format repair budget -- local to the
+# specialist loop, never shared with the supervisor's own
+# MAX_DECISION_REPAIRS counter (a decision-format repair is not an
+# external call, so it is deliberately NOT one of the two bounds this
+# checkpoint's instructions name as shared "across both loops").
+MAX_SPECIALIST_DECISION_REPAIRS = 2
+
 
 # --- allowed actions (closed allowlist; unknown values fail enum validation) -------
 
@@ -52,15 +81,53 @@ class Action(str, Enum):
     ASK_CLARIFICATION = "ask_clarification"
     SYNTHESIZE = "synthesize"
     DEGRADE = "degrade"
+    # Checkpoint Phase 4 D.3: the supervisor's own delegation action --
+    # hands the 5 travel-search tools off to the internal Travel Search
+    # specialist sub-loop (phase4/specialist.py) instead of calling them
+    # directly. Carries no arguments (see CallTravelSearchArgs below) --
+    # the specialist derives what is still needed from the same shared
+    # evidence registry the supervisor itself already uses, exactly like
+    # every other action here never carries a reasoning transcript.
+    CALL_TRAVEL_SEARCH = "call_travel_search"
+    # The specialist's own closed terminal signal -- structurally
+    # distinct from Action.SYNTHESIZE so the specialist can never
+    # produce a supervisor-only action by construction (Pydantic enum
+    # validation rejects it outright), matching this checkpoint's
+    # "specialist cannot call System B or synthesize" requirement at
+    # the schema level, not just by convention.
+    TRAVEL_SEARCH_COMPLETE = "travel_search_complete"
 
 
 # Actions that call out to an external tool -- everything else (ASK_CLARIFICATION,
-# SYNTHESIZE, DEGRADE) is an in-process control decision, never counted
-# against MAX_EXTERNAL_TOOL_CALLS and never routed through Execute/Observe.
+# SYNTHESIZE, DEGRADE, CALL_TRAVEL_SEARCH, TRAVEL_SEARCH_COMPLETE) is an
+# in-process control decision, never counted against MAX_EXTERNAL_TOOL_CALLS
+# and never routed through Execute/Observe itself -- CALL_TRAVEL_SEARCH's
+# own delegated sub-calls each count individually when the specialist
+# loop actually executes them (phase4/specialist.py), attributed to the
+# exact same shared counters the supervisor's own direct tool calls use,
+# so the accounting semantics of MAX_EXTERNAL_TOOL_CALLS/MAX_CALLS_PER_TOOL
+# are unchanged by this checkpoint -- never redefined, only correctly
+# attributed regardless of which loop actually made a given call.
 TOOL_CALL_ACTIONS = frozenset({
     Action.SEARCH_FLIGHTS, Action.SEARCH_STAYS, Action.ESTIMATE_FAIR_PRICE,
     Action.GET_WEATHER, Action.WEB_SEARCH, Action.CALL_ISTANBUL_EXPERT,
 })
+
+# Checkpoint Phase 4 D.3: the closed set of actions the internal Travel
+# Search specialist may ever decide -- exactly the 5 named tools plus its
+# own terminal signal, structurally excluding call_istanbul_expert,
+# ask_clarification, synthesize, degrade, and call_travel_search itself
+# (a specialist can never re-delegate to another specialist -- there is
+# exactly one, never nested). The supervisor's own allowed set is
+# whatever remains: everything in `Action` except these 5 tools (the
+# supervisor no longer decides them directly in production -- it only
+# ever proposes CALL_TRAVEL_SEARCH for that evidence) and except the
+# specialist-only terminal signal.
+SPECIALIST_ACTIONS = frozenset({
+    Action.GET_WEATHER, Action.WEB_SEARCH, Action.SEARCH_FLIGHTS,
+    Action.SEARCH_STAYS, Action.ESTIMATE_FAIR_PRICE, Action.TRAVEL_SEARCH_COMPLETE,
+})
+SUPERVISOR_ACTIONS = frozenset(a for a in Action if a not in SPECIALIST_ACTIONS)
 
 
 class ReasonCode(str, Enum):
@@ -141,6 +208,18 @@ class DegradeArgs(BaseModel):
     reason: str = Field(min_length=1, max_length=300)
 
 
+class CallTravelSearchArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Deliberately empty -- matches SynthesizeArgs's own "no argument
+    # surface for chain-of-thought" pattern. The specialist decides what
+    # is still needed from the shared evidence registry itself.
+
+
+class TravelSearchCompleteArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Deliberately empty -- a closed terminal signal only.
+
+
 ACTION_ARGUMENT_MODELS: dict[Action, type[BaseModel]] = {
     Action.SEARCH_FLIGHTS: SearchFlightsArgs,
     Action.SEARCH_STAYS: SearchStaysArgs,
@@ -151,6 +230,8 @@ ACTION_ARGUMENT_MODELS: dict[Action, type[BaseModel]] = {
     Action.ASK_CLARIFICATION: AskClarificationArgs,
     Action.SYNTHESIZE: SynthesizeArgs,
     Action.DEGRADE: DegradeArgs,
+    Action.CALL_TRAVEL_SEARCH: CallTravelSearchArgs,
+    Action.TRAVEL_SEARCH_COMPLETE: TravelSearchCompleteArgs,
 }
 
 

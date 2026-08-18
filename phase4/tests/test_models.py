@@ -8,6 +8,9 @@ from phase4.models import (
     Action,
     ActionDecision,
     ActionDecisionValidationError,
+    SPECIALIST_ACTIONS,
+    SUPERVISOR_ACTIONS,
+    TOOL_CALL_ACTIONS,
     fingerprint_action,
     parse_action_decision,
 )
@@ -89,3 +92,38 @@ def test_fingerprint_differs_for_different_arguments():
     a = fingerprint_action(Action.GET_WEATHER, {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"})
     b = fingerprint_action(Action.GET_WEATHER, {"location": "Istanbul", "date_from": "2026-09-11", "date_to": "2026-09-11"})
     assert a != b
+
+
+# --- Checkpoint Phase 4 D.3 correction pass: direct audit of TOOL_CALL_ACTIONS -----
+
+
+def test_tool_call_actions_partition_is_exactly_the_six_original_actions():
+    """`TOOL_CALL_ACTIONS` (the set the shared `MAX_EXTERNAL_TOOL_CALLS`/
+    `MAX_CALLS_PER_TOOL` budget applies to at the supervisor's own
+    decide-node level) must be exactly the original 6 D.0 tool actions --
+    never redefined, shrunk, or silently grown by this checkpoint."""
+    assert TOOL_CALL_ACTIONS == {
+        Action.SEARCH_FLIGHTS, Action.SEARCH_STAYS, Action.ESTIMATE_FAIR_PRICE,
+        Action.GET_WEATHER, Action.WEB_SEARCH, Action.CALL_ISTANBUL_EXPERT,
+    }
+
+
+def test_call_istanbul_expert_is_the_one_tool_call_action_the_supervisor_still_owns_directly():
+    """Every other `TOOL_CALL_ACTIONS` member moved to the internal Travel
+    Search specialist's own closed `SPECIALIST_ACTIONS` set -- only
+    `call_istanbul_expert` is both a real `TOOL_CALL_ACTIONS` member AND
+    still supervisor-level (`SUPERVISOR_ACTIONS`), so it is the one
+    action whose per-tool-cap/duplicate-skip bound check still runs
+    inside the supervisor's own `_decide_node`, never the specialist's."""
+    supervisor_owned_tool_calls = TOOL_CALL_ACTIONS & SUPERVISOR_ACTIONS
+    assert supervisor_owned_tool_calls == {Action.CALL_ISTANBUL_EXPERT}
+    specialist_owned_tool_calls = TOOL_CALL_ACTIONS & SPECIALIST_ACTIONS
+    assert specialist_owned_tool_calls == {
+        Action.SEARCH_FLIGHTS, Action.SEARCH_STAYS, Action.ESTIMATE_FAIR_PRICE,
+        Action.GET_WEATHER, Action.WEB_SEARCH,
+    }
+
+
+def test_specialist_and_supervisor_actions_are_a_strict_partition_of_every_action():
+    assert SPECIALIST_ACTIONS.isdisjoint(SUPERVISOR_ACTIONS)
+    assert SPECIALIST_ACTIONS | SUPERVISOR_ACTIONS == set(Action)

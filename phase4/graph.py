@@ -32,17 +32,15 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import ValidationError
 
-from phase1.models import FlightOption, LocalItinerary, ProviderResponseEnvelope
 from phase4.context import ExecutionContext
 from phase4.guards import check_input, check_output
 from phase4.models import (
-    ACTION_ARGUMENT_MODELS,
     MAX_CALLS_PER_TOOL,
     MAX_DECISION_REPAIRS,
     MAX_EXTERNAL_TOOL_CALLS,
     MAX_GRAPH_TRANSITIONS,
+    SUPERVISOR_ACTIONS,
     TOOL_CALL_ACTIONS,
     TOTAL_WORKFLOW_DEADLINE_SECONDS,
     Action,
@@ -53,7 +51,14 @@ from phase4.models import (
     fingerprint_action,
     parse_action_decision,
 )
+from phase4.prompt_contract import action_argument_contract
 from phase4.qwen_client import DecisionProvider, QwenTransportError
+from phase4.specialist import (
+    TravelSearchResult,
+    build_specialist_graph,
+    invoke_travel_search_specialist,
+)
+from phase4.tool_result_validation import validate_tool_result
 from phase4.tools import ToolExecutor
 
 # A duplicate decision is skipped gracefully exactly once; a second
@@ -88,160 +93,15 @@ class PlannerState(TypedDict, total=False):
     rejected: bool
     degraded: bool
     started_at_monotonic: float
-
-
-def _first_error_field(exc: ValidationError) -> str:
-    errors = exc.errors()
-    if not errors:
-        return "unknown"
-    loc = errors[0].get("loc", ("unknown",))
-    return str(loc[0]) if loc else "unknown"
-
-
-def _validate_weather_result(result: dict) -> Optional[str]:
-    """Matches the REAL `providers.weather`/`providers.weather_openmeteo`
-    WeatherResult contract: a "kind"-discriminated shape ("current_observation"
-    with a nested `observation.condition`, or "forecast" with
-    `forecast_days[i].condition") -- not a flat {"location","condition"}
-    shape. Checkpoint D.1 audit finding: the original D.0 check only
-    matched this checkpoint's own fake fixture, not the real provider's
-    actual shape; both the fixture (`phase4/tools.py`) and this check
-    were corrected together."""
-    if "location" not in result:
-        return "missing_location"
-    kind = result.get("kind")
-    if kind == "current_observation":
-        observation = result.get("observation")
-        if not isinstance(observation, dict) or "condition" not in observation:
-            return "missing_observation_condition"
-    elif kind == "forecast":
-        days = result.get("forecast_days")
-        if not isinstance(days, list) or not days or "condition" not in days[0]:
-            return "missing_forecast_condition"
-    else:
-        return "missing_or_unknown_kind"
-    return None
-
-
-def _validate_search_stays_result(result: dict) -> Optional[str]:
-    """Matches the REAL Travel MCP `search_stays` result contract
-    (services/travel-mcp/phase2/serving/models.py::SearchStaysResult) --
-    a nested `{"stays": [{"stay": {...}, "fair_price": {...}, "rank": ...}]}`
-    shape, structurally distinct from `phase1.models.StayOption`.
-    Checkpoint D.1 audit finding: the original D.0 check validated a flat
-    `{"options": [StayOption...]}` shape no real MCP response ever
-    actually produces; both the fixture (`phase4/tools.py`) and this
-    check were corrected together."""
-    stays = result.get("stays")
-    if not isinstance(stays, list) or not stays:
-        return "missing_stays"
-    for item in stays:
-        if not isinstance(item, dict):
-            return "malformed_stay_item"
-        stay = item.get("stay")
-        if not isinstance(stay, dict) or "stay_id" not in stay or "nightly_price" not in stay:
-            return "malformed_stay_item"
-        if "fair_price" not in item:
-            return "missing_fair_price"
-    return None
-
-
-def _validate_estimate_fair_price_result(result: dict) -> Optional[str]:
-    """Matches the REAL Travel MCP `estimate_fair_price` result contract
-    (`EstimateFairPriceResult`) -- nested `fair_price.estimated_fair_price`,
-    not the flat `deal_score`/`components` shape D.0's original fixture
-    invented."""
-    if "stay_id" not in result or "fair_price" not in result:
-        return "missing_fair_price_fields"
-    fair_price = result.get("fair_price")
-    if not isinstance(fair_price, dict) or "estimated_fair_price" not in fair_price:
-        return "malformed_fair_price"
-    return None
-
-
-# Checkpoint D.1 audit finding: `ProviderResponseEnvelope` (ADR 0009 §5)
-# is specifically the root `providers/` package's own convention --
-# search_flights/get_weather/web_search results really are wrapped in it.
-# Travel MCP (search_stays/estimate_fair_price) and System B's A2A
-# artifact (call_istanbul_expert) each have their own, different, real
-# result contract and were never wrapped in this envelope at all; the
-# original D.0 validator wrongly required it for every action, which
-# only ever matched this checkpoint's own (also wrong, now corrected)
-# fake fixture shapes, never the real MCP/A2A contracts.
-_ENVELOPE_WRAPPED_ACTIONS = frozenset({Action.SEARCH_FLIGHTS, Action.GET_WEATHER, Action.WEB_SEARCH})
-
-
-def _validate_tool_result(action: Action, candidate: Any) -> Optional[str]:
-    """Validates a raw tool result against the reused, unmodified
-    `phase1.models` mirrors before it is ever allowed into state.
-    Returns None on success, or a short, safe validation-failure code
-    otherwise -- never the raw pydantic error text."""
-    if not isinstance(candidate, dict):
-        return "not_a_dict"
-
-    if action in _ENVELOPE_WRAPPED_ACTIONS:
-        try:
-            envelope = ProviderResponseEnvelope.model_validate(candidate)
-        except ValidationError as exc:
-            return f"envelope_invalid:{_first_error_field(exc)}"
-        result = envelope.result
-        if not isinstance(result, dict):
-            return "result_not_a_dict"
-    else:
-        result = candidate
-
-    try:
-        if action == Action.SEARCH_FLIGHTS:
-            options = result.get("options")
-            if not isinstance(options, list) or not options:
-                return "missing_options"
-            for opt in options:
-                FlightOption.model_validate(opt)
-        elif action == Action.SEARCH_STAYS:
-            stays_error = _validate_search_stays_result(result)
-            if stays_error is not None:
-                return stays_error
-        elif action == Action.ESTIMATE_FAIR_PRICE:
-            price_error = _validate_estimate_fair_price_result(result)
-            if price_error is not None:
-                return price_error
-        elif action == Action.GET_WEATHER:
-            weather_error = _validate_weather_result(result)
-            if weather_error is not None:
-                return weather_error
-        elif action == Action.WEB_SEARCH:
-            if not isinstance(result.get("items"), list):
-                return "missing_web_search_items"
-        elif action == Action.CALL_ISTANBUL_EXPERT:
-            LocalItinerary.model_validate(result)
-    except ValidationError as exc:
-        return f"result_invalid:{_first_error_field(exc)}"
-
-    return None
-
-
-def _strip_titles(node: Any) -> Any:
-    if isinstance(node, dict):
-        return {key: _strip_titles(value) for key, value in node.items() if key != "title"}
-    if isinstance(node, list):
-        return [_strip_titles(item) for item in node]
-    return node
-
-
-def _action_argument_contract() -> dict[str, Any]:
-    """The prompt's per-action argument contract, generated directly from
-    `ACTION_ARGUMENT_MODELS` -- the exact same canonical registry
-    `parse_action_decision` validates a decision's arguments against
-    (Checkpoint D.0 repair: this must never be a second, hand-maintained
-    schema that could drift from the real one). Each entry is that
-    action's own `BaseModel.model_json_schema()` (Pydantic's own JSON
-    Schema, carrying `required`, enum/pattern/format/min/max constraints,
-    and `additionalProperties: false` automatically from
-    `ConfigDict(extra="forbid")`) -- with only the purely-cosmetic
-    `title` keys stripped to keep the prompt compact. Stable action
-    ordering (`Action`'s own declared enum order) makes this
-    deterministic across calls."""
-    return {action.value: _strip_titles(model.model_json_schema()) for action, model in ACTION_ARGUMENT_MODELS.items()}
+    # Checkpoint Phase 4 D.3 (correction pass): set by Execute for
+    # exactly one physical step when the supervisor delegated to the
+    # internal Travel Search specialist -- a genuinely separate,
+    # compiled LangGraph `StateGraph` (`phase4/specialist.py`), never a
+    # plain Python loop. Tells Observe to skip its normal single-result
+    # validation path (the specialist already validated and merged every
+    # sub-observation itself into a typed, validated `TravelSearchResult`
+    # before returning it).
+    specialist_delegated: bool
 
 
 # One concrete, valid, minimal example for exactly this checkpoint's own
@@ -249,31 +109,43 @@ def _action_argument_contract() -> dict[str, Any]:
 # a single fixed constant (not derived) since an *example instance* is
 # not something a JSON Schema itself expresses; the schema above remains
 # the authoritative contract this example must itself satisfy.
-_EXAMPLE_DECISION = {
-    "action": "search_flights",
-    "arguments": {
-        "origin": "BEY",
-        "destination": "IST",
-        "depart_date": "2026-09-10",
-        "passenger_count": 1,
-        "cabin_class": "economy",
-    },
+_SUPERVISOR_EXAMPLE_DECISION = {
+    "action": "call_travel_search",
+    "arguments": {},
     "reason_code": "missing_flight_info",
-    "explanation": "Flight information is required.",
+    "explanation": "Flight, stay, and weather information are required.",
 }
 
 
 def _build_decision_prompt(state: PlannerState) -> tuple[str, str]:
     """Returns (system, user) -- local values only, never persisted into
     state, trace, or a checkpoint (Checkpoint D.0 §3/§7: no complete Qwen
-    prompt is ever stored)."""
-    allowed = ", ".join(a.value for a in Action)
+    prompt is ever stored).
+
+    Checkpoint Phase 4 D.3: the supervisor's own allowed-action list is
+    now `SUPERVISOR_ACTIONS` (was: every `Action`) -- it no longer offers
+    the 5 travel-search tools as options at all; it only ever sees
+    `call_travel_search` for that evidence, which the internal Travel
+    Search specialist (`phase4.specialist.invoke_travel_search_specialist`)
+    handles. This is
+    a structural, schema-level restriction (the tool's own JSON Schema
+    contract is not even shown), not merely a prompt-wording change --
+    `parse_action_decision` would reject any of the 5 tool names here
+    regardless of what the prompt said, since only `SUPERVISOR_ACTIONS`
+    entries appear in the contract Qwen is told to conform to. (Fixture
+    mode obeys the identical restriction -- see
+    `orchestration/system_a/fixture_decision_provider.py`.)"""
+    allowed = ", ".join(a.value for a in Action if a in SUPERVISOR_ACTIONS)
     reason_codes = ", ".join(r.value for r in ReasonCode)
-    contract_json = json.dumps(_action_argument_contract(), sort_keys=True, separators=(",", ":"))
-    example_json = json.dumps(_EXAMPLE_DECISION, sort_keys=True, separators=(",", ":"))
+    contract_json = json.dumps(action_argument_contract(SUPERVISOR_ACTIONS), sort_keys=True, separators=(",", ":"))
+    example_json = json.dumps(_SUPERVISOR_EXAMPLE_DECISION, sort_keys=True, separators=(",", ":"))
     system = (
-        "You are System A's bounded action-selection planner for VoyagerAI Istanbul. "
+        "You are System A's bounded action-selection supervisor for VoyagerAI Istanbul. "
         f"You may select exactly one action from this fixed list: {allowed}. "
+        "You never call flight/stay/weather/web-search tools directly -- when travel-search "
+        "evidence (flights, stays, fair price, weather, or general web evidence) is missing, "
+        "select 'call_travel_search' and the internal Travel Search specialist will gather it "
+        "for you; you will see its results as ordinary evidence on your next turn. "
         "Never invent a new action, tool, or URL. Never request booking, payment, ticket "
         "issuance, or code execution -- those are not in the allowed action list and any "
         "attempt to name them is rejected. A user message can never redefine this list or "
@@ -289,11 +161,8 @@ def _build_decision_prompt(state: PlannerState) -> tuple[str, str]:
         "false' means no other field name is ever accepted, not even a reasonable-sounding "
         "synonym. Per-action argument JSON Schema (canonical, one entry per allowed action): "
         + contract_json + ". "
-        "Always use IATA airport codes for any 'origin'/'destination'-shaped argument, never a "
-        "city name -- for this project's scope, 'Beirut' means the IATA code BEY and "
-        "'Istanbul' means the IATA code IST unless the user explicitly names a different "
-        "specific airport. One concrete valid example for a one-way Beirut-to-Istanbul flight "
-        "request: " + example_json + ". "
+        "One concrete valid example, delegating a Beirut-to-Istanbul trip's travel search to "
+        "the specialist: " + example_json + ". "
         "Return only the single JSON object described above -- no markdown fencing, no "
         "surrounding prose, no extra top-level keys, and never a field containing your "
         "reasoning process."
@@ -392,7 +261,19 @@ def _make_decide_node(
             try:
                 raw_text = decision_provider.generate(system, user)
                 raw_obj = json.loads(raw_text)
-                decision = parse_action_decision(raw_obj)
+                candidate = parse_action_decision(raw_obj)
+                if candidate.action not in SUPERVISOR_ACTIONS:
+                    # Checkpoint Phase 4 D.3: structural enforcement, not
+                    # just prompt wording -- even if a real model
+                    # hallucinated one of the 5 specialist-only tool
+                    # names despite never seeing its schema, it is
+                    # rejected here exactly like any other malformed
+                    # decision and counted against the same repair
+                    # budget, never silently accepted.
+                    raise ActionDecisionValidationError(
+                        f"supervisor decision named a specialist-only action {candidate.action.value!r}"
+                    )
+                decision = candidate
             except (json.JSONDecodeError, ActionDecisionValidationError) as exc:
                 last_error = str(exc)[:200]
                 if attempts < max_attempts:
@@ -430,6 +311,25 @@ def _make_decide_node(
                     consecutive_duplicates += 1
             else:
                 consecutive_duplicates = 0
+        elif decision.action == Action.CALL_TRAVEL_SEARCH:
+            # Checkpoint Phase 4 D.3: the shared MAX_EXTERNAL_TOOL_CALLS
+            # ceiling is the only bound that applies here -- a
+            # per-tool-call cap and fingerprint-based duplicate-skip
+            # would not make sense for a no-argument delegation action
+            # (its fingerprint never varies, so it would misfire as a
+            # "duplicate" after the very first delegation ever, even
+            # when a second delegation round has genuinely new evidence
+            # to gather). The internal specialist's own loop is what
+            # actually prevents wasted/duplicate tool calls once
+            # delegated (phase4/specialist.py's own per-tool-cap/
+            # duplicate/external-call/recursion-limit bounds); the
+            # ultimate backstop against a pathological repeated
+            # no-progress delegation remains the same MAX_GRAPH_TRANSITIONS
+            # recursion-limit safety net already established for every
+            # other loop shape (ADR 0014 §5's own documented precedent).
+            if tool_call_count >= MAX_EXTERNAL_TOOL_CALLS:
+                decision = ActionDecision(action=Action.SYNTHESIZE, arguments={}, reason_code=ReasonCode.BOUND_REACHED)
+            consecutive_duplicates = 0
         else:
             consecutive_duplicates = 0
 
@@ -450,7 +350,11 @@ def _make_decide_node(
 
 
 def _make_execute_node(
-    tool_executor: ToolExecutor, cancellation_check: Callable[[], bool]
+    tool_executor: ToolExecutor,
+    cancellation_check: Callable[[], bool],
+    specialist_graph: CompiledStateGraph,
+    monotonic_clock: Callable[[], float],
+    specialist_event_callback: Optional[Callable[[dict[str, Any]], None]],
 ) -> Callable[[PlannerState], dict[str, Any]]:
     def _execute_node(state: PlannerState) -> dict[str, Any]:
         trace = list(state.get("trace", []))
@@ -464,6 +368,48 @@ def _make_execute_node(
             return {
                 "graph_transition_count": transitions, "trace": trace, "cancelled": True,
                 "pending_raw_tool_result": {"status": "cancelled", "result": None},
+            }
+
+        if action == Action.CALL_TRAVEL_SEARCH:
+            # Checkpoint Phase 4 D.3 (correction pass): `specialist_graph`
+            # is a genuinely separate, already-compiled LangGraph
+            # `StateGraph` (`phase4/specialist.py`) -- this call drives
+            # ITS OWN real transitions/nodes, never a plain Python loop.
+            # It shares the supervisor's own cancellation flag, clock
+            # origin, and running counters/fingerprints (seeded in,
+            # merged back out below) -- never a second, independent copy.
+            result: TravelSearchResult = invoke_travel_search_specialist(
+                specialist_graph,
+                session_id=state.get("session_id", ""),
+                trace_id=state.get("trace_id", ""),
+                normalized_request=state.get("normalized_request", {}),
+                inherited_observations=state.get("observations", []),
+                tool_call_count=state.get("tool_call_count", 0),
+                tool_call_count_by_action=state.get("tool_call_count_by_action", {}),
+                executed_fingerprints=state.get("executed_fingerprints", []),
+                started_at_monotonic=(
+                    state["started_at_monotonic"] if state.get("started_at_monotonic") is not None
+                    else monotonic_clock()
+                ),
+                on_event=specialist_event_callback,
+            )
+            observation_dicts = [obs.model_dump(mode="json") for obs in result.observations]
+            tool_call_count = state.get("tool_call_count", 0) + result.calls_consumed
+            trace.append({
+                "node": "Execute", "action": "call_travel_search", "status": "delegated",
+                "specialist_status": result.status,
+                "specialist_actions": [obs["action"] for obs in observation_dicts],
+                "specialist_transitions": result.transitions_consumed,
+            })
+            return {
+                "graph_transition_count": transitions, "trace": trace,
+                "tool_call_count": tool_call_count,
+                "tool_call_count_by_action": result.tool_call_count_by_action,
+                "observations": state.get("observations", []) + observation_dicts,
+                "executed_fingerprints": state.get("executed_fingerprints", []) + result.new_fingerprints,
+                "warnings": state.get("warnings", []) + result.warnings,
+                "pending_raw_tool_result": None,
+                "specialist_delegated": True,
             }
 
         context = ExecutionContext(
@@ -513,9 +459,26 @@ def _observe_node(state: PlannerState) -> dict[str, Any]:
     five-tool plan down to a real, empirically re-measured, comfortably
     bounded transition count (docs/adr/0014-...md), without loosening
     the 25-transition ceiling itself, without touching the 9 declared
-    LangGraph node names, and without changing any other bound."""
+    LangGraph node names, and without changing any other bound.
+
+    Checkpoint Phase 4 D.3: when Execute delegated to the internal
+    Travel Search specialist (a genuinely separate compiled LangGraph
+    `StateGraph`, `phase4/specialist.py`), it already validated and
+    merged every sub-observation itself (the exact same shared
+    `validate_tool_result` function, just called once per specialist
+    tool call instead of once here) -- this node's own single-result
+    validation path would be wrong to run again (there is no single
+    `pending_raw_tool_result` to validate for a delegation), so it is
+    skipped via the `specialist_delegated` flag, recording only a trace
+    entry."""
     trace = list(state.get("trace", []))
     transitions = state.get("graph_transition_count", 0) + 1
+
+    if state.get("specialist_delegated"):
+        trace.append({"node": "Observe", "action": "call_travel_search", "status": "delegated"})
+        trace.append({"node": "Update", "status": "merged"})
+        return {"graph_transition_count": transitions, "trace": trace, "specialist_delegated": False}
+
     pending = state["pending_action"]
     action = Action(pending["action"])
     arguments = pending["arguments"]
@@ -527,7 +490,7 @@ def _observe_node(state: PlannerState) -> dict[str, Any]:
 
     if status == "success":
         candidate = raw.get("result")
-        validation_error = _validate_tool_result(action, candidate)
+        validation_error = validate_tool_result(action, candidate)
         if validation_error is not None:
             status = "provider_error"
             warnings.append(f"malformed_tool_result:{action.value}:{validation_error}")
@@ -655,15 +618,41 @@ def _route_after_decide(state: PlannerState) -> str:
 def build_graph(
     tool_executor: ToolExecutor,
     decision_provider: DecisionProvider,
+    specialist_decision_provider: DecisionProvider,
     cancellation_check: Callable[[], bool] = lambda: False,
     monotonic_clock: Callable[[], float] = time.monotonic,
     checkpointer: Optional[BaseCheckpointSaver] = None,
+    specialist_event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> CompiledStateGraph:
+    """`decision_provider` is the SUPERVISOR's own `DecisionProvider`;
+    `specialist_decision_provider` is a SEPARATE, explicitly supplied
+    instance for the internal Travel Search specialist (Checkpoint Phase
+    4 D.3 correction pass, ADR 0017 §3) -- the two roles are always
+    distinguished by which object the caller constructed and passed in,
+    never by inspecting prompt text at runtime. Passing the same instance
+    for both is possible (real `QwenDecisionProvider` is stateless per
+    call) but production wiring constructs two, for symmetry with
+    fixture mode's own two distinct provider classes.
+
+    `specialist_event_callback`, when provided, is called in real time --
+    once per real specialist LangGraph transition, DURING the specialist
+    graph's own `.stream()` iteration -- with a sanitized
+    `{"stage": "action_started"|"action_completed"|"action_failed",
+    "action": ..., "status": ...}` event (see
+    `phase4.specialist.invoke_travel_search_specialist`). Never a batch
+    emitted after the whole delegation has already completed."""
+    specialist_graph = build_specialist_graph(
+        tool_executor, specialist_decision_provider, cancellation_check, monotonic_clock,
+    )
+
     graph = StateGraph(PlannerState)
     graph.add_node("input_guard", _input_guard_node)
     graph.add_node("load_session", _load_session_node)
     graph.add_node("decide", _make_decide_node(decision_provider, cancellation_check, monotonic_clock))
-    graph.add_node("execute", _make_execute_node(tool_executor, cancellation_check))
+    graph.add_node(
+        "execute",
+        _make_execute_node(tool_executor, cancellation_check, specialist_graph, monotonic_clock, specialist_event_callback),
+    )
     graph.add_node("observe", _observe_node)
     graph.add_node("update", _update_node)
     graph.add_node("synthesize", _synthesize_node)

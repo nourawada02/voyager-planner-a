@@ -5,8 +5,12 @@ network call anywhere in this file."""
 from __future__ import annotations
 
 from phase4.context import ExecutionContext
-from phase4.graph import _validate_estimate_fair_price_result, _validate_search_stays_result, _validate_weather_result
 from phase4.models import Action
+from phase4.tool_result_validation import (
+    _validate_estimate_fair_price_result,
+    _validate_search_stays_result,
+    _validate_weather_result,
+)
 from phase4.tools import FakeToolExecutor
 
 
