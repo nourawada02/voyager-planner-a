@@ -56,6 +56,14 @@ def _decision(action: str, arguments: dict, reason_code: str = "all_required_evi
     return json.dumps({"action": action, "arguments": arguments, "reason_code": reason_code, "explanation": "ok"})
 
 
+def _classification(scope: str, reason_code: str = "requires_travel_evidence") -> str:
+    """Checkpoint Final Evaluation E.1S.1: every case's scripted plan now
+    needs its own capability-scope classification response as the FIRST
+    queued decision -- the supervisor's Decide node classifies once per
+    turn before it ever asks for an action decision."""
+    return json.dumps({"scope": scope, "reason_code": reason_code})
+
+
 FULL_TRIP_REQUEST = {
     "session_id": "11111111-1111-1111-1111-111111111111",
     "trace_id": "22222222-2222-2222-2222-222222222222",
@@ -89,6 +97,7 @@ CASES: list[EvalCase] = [
         user_message="Plan my Istanbul trip",
         trip_request=FULL_TRIP_REQUEST,
         decisions=[
+            _classification("combined", "requires_both"),
             _decision("call_travel_search", {}, "missing_flight_info"),
             _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
             _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 2}, "missing_flight_info"),
@@ -108,6 +117,7 @@ CASES: list[EvalCase] = [
         user_message="Find me a one-way flight from Beirut to Istanbul on 2026-09-10.",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_flight_info"),
             _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}, "missing_flight_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -123,6 +133,7 @@ CASES: list[EvalCase] = [
         user_message="I need a place to stay in Istanbul.",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_stay_info"),
             _decision("search_stays", {"check_in": "2026-09-10", "check_out": "2026-09-15", "guest_count": 1}, "missing_stay_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -138,6 +149,7 @@ CASES: list[EvalCase] = [
         user_message="What's the weather in Istanbul on 2026-09-10?",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_weather_info"),
             _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -153,6 +165,7 @@ CASES: list[EvalCase] = [
         user_message="What are Hagia Sophia's current opening hours?",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_current_info"),
             _decision("web_search", {"query": "Hagia Sophia current opening hours"}, "missing_current_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -168,6 +181,7 @@ CASES: list[EvalCase] = [
         user_message="Plan my days around my stay in Istanbul.",
         trip_request=None,
         decisions=[
+            _classification("combined", "requires_both"),
             _decision("call_travel_search", {}, "missing_stay_info"),
             _decision("search_stays", {"check_in": "2026-09-10", "check_out": "2026-09-15", "guest_count": 1}, "missing_stay_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -184,6 +198,7 @@ CASES: list[EvalCase] = [
         user_message="What should I see near Sultanahmet?",
         trip_request=None,
         decisions=[
+            _classification("istanbul_local_only", "requires_istanbul_local_grounding"),
             # No travel-search evidence is needed for a pure local-
             # knowledge question -- ground truth is that the supervisor
             # calls System B directly, WITHOUT ever delegating.
@@ -222,6 +237,7 @@ CASES: list[EvalCase] = [
         user_message="What's the weather in Nowhere?",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_weather_info"),
             _decision("get_weather", {"location": "Nowhere", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -238,6 +254,7 @@ CASES: list[EvalCase] = [
         user_message="I need a place to stay.",
         trip_request=None,
         decisions=[
+            _classification("travel_only"),
             _decision("call_travel_search", {}, "missing_stay_info"),
             _decision("search_stays", {"check_in": "2026-09-10", "check_out": "2026-09-15", "guest_count": 1}, "missing_stay_info"),
             _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -410,6 +427,7 @@ def test_duplicate_follow_up_request_is_never_re_executed():
 
     tools = FakeToolExecutor()
     decider = _ScriptedProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -421,6 +439,7 @@ def test_duplicate_follow_up_request_is_never_re_executed():
     assert first["final_result"]["status"] == "success"
     assert len(tools.call_log) == 1
 
+    decider.responses.append(_classification("travel_only"))
     decider.responses.append(_decision("call_travel_search", {}, "missing_weather_info"))
     decider.responses.append(
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info")

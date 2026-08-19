@@ -65,12 +65,43 @@ def test_generated_prompt_contains_every_canonical_action():
     (`SUPERVISOR_ACTIONS`/`SPECIALIST_ACTIONS`, a strict partition of
     every `Action` member) -- never the other loop's tools -- so this
     checks each prompt against its own scoped list rather than every
-    `Action` against a single prompt."""
+    `Action` against a single prompt.
+
+    Checkpoint Final Evaluation E.1Y: `call_travel_search`/
+    `call_istanbul_expert`/`synthesize` are named in the prompt's own
+    FIXED routing-guidance prose regardless of which actions are
+    currently eligible, so `_minimal_state()` (no capability_plan at all)
+    still exercises them. `ask_clarification`/`degrade` are no longer
+    unconditionally present -- `compute_eligible_supervisor_actions` now
+    gates them structurally (E.1Y) -- so each is checked against a state
+    that actually makes it eligible."""
     supervisor_system, _ = _build_decision_prompt(_minimal_state())
-    for action in SUPERVISOR_ACTIONS:
+    for action in (Action.CALL_TRAVEL_SEARCH, Action.CALL_ISTANBUL_EXPERT, Action.SYNTHESIZE):
         assert action.value in supervisor_system
     for action in SPECIALIST_ACTIONS:
         assert action.value not in supervisor_system
+
+    clarification_state = {
+        "observations": [], "normalized_request": {"user_message": "Find me a flight."},
+        "capability_plan": {
+            "scope": "clarification_required", "request_signature": "sig-clarify",
+            "classification_succeeded": True, "reason_code": "insufficient_information",
+            "scope_source": "classified",
+        },
+    }
+    clarification_system, _ = _build_decision_prompt(clarification_state)
+    assert Action.ASK_CLARIFICATION.value in clarification_system
+
+    out_of_scope_state = {
+        "observations": [], "normalized_request": {"user_message": "Find me a flight."},
+        "capability_plan": {
+            "scope": "out_of_scope", "request_signature": "sig-oos",
+            "classification_succeeded": True, "reason_code": "outside_project_scope",
+            "scope_source": "classified",
+        },
+    }
+    out_of_scope_system, _ = _build_decision_prompt(out_of_scope_state)
+    assert Action.DEGRADE.value in out_of_scope_system
 
     specialist_system, _ = _build_specialist_prompt(_minimal_specialist_state())
     for action in SPECIALIST_ACTIONS:

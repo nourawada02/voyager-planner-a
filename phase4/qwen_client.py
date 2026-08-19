@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Optional, Protocol
 
 QWEN_MODEL_DEFAULT = "qwen3.7-flash"
 
@@ -56,7 +56,25 @@ class QwenTransportError(RuntimeError):
     key: it is sent only via the Authorization header, never as a query
     parameter). The caller (Decide node) maps this to a safe structured
     `status="provider_error"`/`"timeout"` outcome -- it never reaches a
-    user-facing result as raw exception text."""
+    user-facing result as raw exception text.
+
+    Checkpoint Final Evaluation E.1S: carries `status_code` (the HTTP
+    status when one exists, else `None`) and `transient` -- True only for
+    a network-level failure with no HTTP response at all (DNS/connect/
+    timeout) or an HTTP status in {429, 500, 502, 503, 504}. Every other
+    HTTP status (auth/permission/other permanent 4xx) and every
+    response-shape failure (invalid JSON, missing content field) is
+    `transient=False`. Classified once, here, at the single point that
+    already distinguishes these failure kinds -- the caller never
+    re-derives this from the message string."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None, transient: bool = False) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = transient
+
+
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 def _qwen_api_key() -> str:
@@ -127,13 +145,25 @@ class QwenDecisionProvider:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise QwenTransportError(f"Qwen HTTP error: status={exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise QwenTransportError("Qwen transport failure") from exc
+            raise QwenTransportError(
+                f"Qwen HTTP error: status={exc.code}",
+                status_code=exc.code, transient=exc.code in _TRANSIENT_HTTP_STATUSES,
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            # No HTTP response was ever received at all (DNS failure --
+            # urllib.error.URLError; connection refused/reset -- ConnectionError;
+            # socket timeout -- TimeoutError) -- always transient. Checkpoint
+            # E.1S.1: deliberately narrower than a blanket `OSError`, which
+            # also covers unrelated local failures (e.g. a filesystem error)
+            # that are not a transient network condition and should never be
+            # silently retried.
+            raise QwenTransportError("Qwen transport failure", transient=True) from exc
         except json.JSONDecodeError as exc:
-            raise QwenTransportError("Qwen response was not valid JSON") from exc
+            # A malformed response body is a response-shape problem, not a
+            # transient network condition -- retrying would not help.
+            raise QwenTransportError("Qwen response was not valid JSON", transient=False) from exc
 
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise QwenTransportError("Qwen response missing expected content field") from exc
+            raise QwenTransportError("Qwen response missing expected content field", transient=False) from exc

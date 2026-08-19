@@ -140,6 +140,61 @@ def test_network_error_maps_to_transport_error(monkeypatch):
         QwenDecisionProvider().generate("system", "user")
 
 
+def test_http_503_is_classified_transient(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", _ephemeral_test_secret())
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+
+    def _fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(url="https://qwen.example.com/v1/chat/completions", code=503, msg="Service Unavailable", hdrs=None, fp=None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    with pytest.raises(QwenTransportError) as excinfo:
+        QwenDecisionProvider().generate("system", "user")
+    assert excinfo.value.transient is True
+    assert excinfo.value.status_code == 503
+
+
+def test_http_401_is_classified_permanent_not_transient(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", _ephemeral_test_secret())
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+
+    def _fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(url="https://qwen.example.com/v1/chat/completions", code=401, msg="Unauthorized", hdrs=None, fp=None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    with pytest.raises(QwenTransportError) as excinfo:
+        QwenDecisionProvider().generate("system", "user")
+    assert excinfo.value.transient is False
+    assert excinfo.value.status_code == 401
+
+
+def test_connection_error_is_classified_transient(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", _ephemeral_test_secret())
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+
+    def _fake_urlopen(request, timeout=None):
+        raise ConnectionResetError("simulated connection reset")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    with pytest.raises(QwenTransportError) as excinfo:
+        QwenDecisionProvider().generate("system", "user")
+    assert excinfo.value.transient is True
+    assert excinfo.value.status_code is None
+
+
+def test_malformed_json_response_is_classified_permanent_not_transient(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", _ephemeral_test_secret())
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+
+    def _fake_urlopen(request, timeout=None):
+        return _FakeUrlopenResponse(b"not valid json {{{")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    with pytest.raises(QwenTransportError) as excinfo:
+        QwenDecisionProvider().generate("system", "user")
+    assert excinfo.value.transient is False
+
+
 def test_provider_repr_never_contains_the_key(monkeypatch):
     secret_value = _ephemeral_test_secret()
     monkeypatch.setenv("QWEN_API_KEY", secret_value)

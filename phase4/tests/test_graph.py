@@ -17,7 +17,15 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.state import CompiledStateGraph
 
-from phase4.graph import PlannerState, _make_decide_node, build_graph, resume_session, start_session
+from phase4.graph import (
+    CAPABILITY_SCOPE_PROMPT_MARKER,
+    PlannerState,
+    _compute_request_signature,
+    _make_decide_node,
+    build_graph,
+    resume_session,
+    start_session,
+)
 from phase4.models import Action, PlannerRequest
 from phase4.qwen_client import QwenTransportError
 from phase4.specialist import build_specialist_graph, invoke_travel_search_specialist
@@ -38,6 +46,23 @@ VALID_TRIP_REQUEST = {
 
 def _decision(action: str, arguments: dict, reason_code: str = "missing_flight_info", explanation: str = "ok") -> str:
     return json.dumps({"action": action, "arguments": arguments, "reason_code": reason_code, "explanation": explanation})
+
+
+def _classification(scope: str, reason_code: str = "requires_travel_evidence") -> str:
+    """Checkpoint Final Evaluation E.1S.1: every scripted supervisor run
+    now needs exactly one of these as its FIRST queued response -- the
+    supervisor's Decide node classifies the request's capability scope
+    once per turn before it ever asks for an action decision."""
+    return json.dumps({"scope": scope, "reason_code": reason_code})
+
+
+def _seeded_capability_plan(user_message: str, trip_request: dict | None, scope: str, reason_code: str = "requires_travel_evidence") -> dict:
+    """For tests that call `_make_decide_node`'s node function directly
+    with a hand-built state dict -- seeds an already-matching
+    `capability_plan` so Decide reuses it instead of issuing an extra
+    classification call the test's own scripted decider never queued."""
+    signature = _compute_request_signature({"normalized_request": {"user_message": user_message, "trip_request": trip_request}})
+    return {"scope": scope, "request_signature": signature, "classification_succeeded": True, "reason_code": reason_code}
 
 
 class ScriptedDecisionProvider:
@@ -77,6 +102,8 @@ class InfiniteCallTravelSearchProvider:
     the only bound that can possibly stop it."""
 
     def generate(self, system: str, user: str) -> str:
+        if CAPABILITY_SCOPE_PROMPT_MARKER in system:
+            return _classification("travel_only")
         return _decision("call_travel_search", {}, "missing_flight_info")
 
 
@@ -114,6 +141,7 @@ def test_graph_is_a_real_compiled_langgraph_state_graph():
 def test_weather_only_question_invokes_only_get_weather():
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -127,6 +155,7 @@ def test_weather_only_question_invokes_only_get_weather():
 def test_flight_only_request_invokes_only_search_flights():
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -140,6 +169,7 @@ def test_flight_only_request_invokes_only_search_flights():
 def test_current_hours_question_may_invoke_web_search():
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_current_info"),
         _decision("web_search", {"query": "Hagia Sophia current opening hours"}, "missing_current_info"),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -153,6 +183,7 @@ def test_current_hours_question_may_invoke_web_search():
 def test_full_trip_request_chooses_relevant_capabilities_and_skips_irrelevant_ones():
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 2}),
         _decision("search_stays", {"check_in": "2026-09-10", "check_out": "2026-09-15", "guest_count": 2}, "missing_stay_info"),
@@ -171,6 +202,7 @@ def test_full_trip_request_chooses_relevant_capabilities_and_skips_irrelevant_on
 
 def test_missing_essential_input_triggers_clarification():
     decider = ScriptedDecisionProvider([
+        _classification("clarification_required", "insufficient_information"),
         _decision(
             "ask_clarification",
             {"missing_fields": ["depart_date", "origin"], "question": "What are your departure city and date?"},
@@ -205,6 +237,7 @@ def test_duplicate_action_is_blocked_not_re_executed():
     tools = FakeToolExecutor()
     question_args = {"question": "What should I see near my stay?"}
     decider = ScriptedDecisionProvider([
+        _classification("istanbul_local_only", "requires_istanbul_local_grounding"),
         _decision("call_istanbul_expert", question_args, "missing_local_expertise"),
         _decision("call_istanbul_expert", question_args, "missing_local_expertise"),  # identical -- must be skipped, not re-executed
         _decision("synthesize", {}, "all_required_evidence_present"),
@@ -226,6 +259,7 @@ def test_specialist_duplicate_call_breaks_the_delegation_loop_without_re_executi
     tools = FakeToolExecutor()
     weather_args = {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", weather_args, "missing_weather_info"),
         _decision("get_weather", weather_args, "missing_weather_info"),  # identical -- breaks the specialist loop
@@ -239,43 +273,84 @@ def test_specialist_duplicate_call_breaks_the_delegation_loop_without_re_executi
 
 def test_unknown_action_is_rejected_and_repaired():
     decider = ScriptedDecisionProvider([
+        _classification("clarification_required", "insufficient_information"),
         json.dumps({"action": "delete_everything", "arguments": {}, "reason_code": "missing_flight_info"}),
-        _decision("synthesize", {}, "all_required_evidence_present"),
+        _decision(
+            "ask_clarification", {"missing_fields": ["destination"], "question": "Which city are you asking about?"},
+            "missing_essential_input",
+        ),
     ])
     result = start_session(_build(decider), _request("hello"), "t-unknown-action")
-    assert result["final_result"]["status"] in ("success", "unavailable")
+    assert result["final_result"]["status"] == "needs_clarification"
     decide_entries = [t for t in result["trace"] if t["node"] == "Decide"]
-    assert any(entry["repair_attempts"] >= 1 for entry in decide_entries)
+    assert any(entry.get("repair_attempts", 0) >= 1 for entry in decide_entries)
 
 
 def test_malformed_qwen_json_repairs_at_most_twice_then_degrades():
-    decider = ScriptedDecisionProvider(["not valid json {{{", "still not valid", "also not valid"])
+    """Checkpoint Final Evaluation E.1Y: once the format-repair budget
+    (1 initial + 2 repairs) is exhausted, the synthetic fallback decision
+    is `degrade` -- but for a `clarification_required` scope, `degrade`
+    is no longer unconditionally eligible (E.1Y's own deterministic
+    policy), so it is itself rejected and gets the one bounded
+    ineligibility correction attempt before finally terminating. Still
+    bounded, still safely terminates -- one additional scripted response
+    is required for that correction attempt (also invalid here, proving
+    the bound holds even when correction itself fails)."""
+    decider = ScriptedDecisionProvider([
+        _classification("clarification_required"), "not valid json {{{", "still not valid", "also not valid",
+        "still invalid after the ineligibility correction too",
+    ])
     result = start_session(_build(decider), _request("hello"), "t-repair-exhausted")
     assert result["final_result"]["status"] == "degraded"
-    assert len(decider.call_log) == 3  # 1 initial attempt + 2 repairs, never more
-    assert result["repair_count"] == 2
+    assert len(decider.call_log) == 5  # 1 classification + (1 initial + 2 repairs) + 1 bounded ineligibility correction
+    assert result["repair_count"] == 3
 
 
 def test_malformed_qwen_json_recovers_within_the_repair_budget():
     decider = ScriptedDecisionProvider([
+        _classification("clarification_required", "insufficient_information"),
         "not valid json {{{",
-        _decision("synthesize", {}, "all_required_evidence_present"),
+        _decision(
+            "ask_clarification", {"missing_fields": ["destination"], "question": "Which city?"}, "missing_essential_input",
+        ),
     ])
     result = start_session(_build(decider), _request("hello"), "t-repair-recovers")
-    assert result["final_result"]["status"] in ("success", "unavailable")
+    assert result["final_result"]["status"] == "needs_clarification"
     assert result["repair_count"] == 1
 
 
 def test_qwen_transport_failure_degrades_safely():
-    decider = ScriptedDecisionProvider([QwenTransportError("simulated transport failure")])
+    """Checkpoint Final Evaluation E.1Y: a transport failure during the
+    main decision call produces a synthetic `degrade` (tool_unavailable)
+    -- for `travel_only` with no `trip_request`, `degrade` is not itself
+    eligible (only `call_travel_search`/`ask_clarification` are), so it
+    gets the one bounded ineligibility correction attempt; a second
+    transport failure there still terminates safely as `degraded`."""
+    decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
+        QwenTransportError("simulated transport failure"),
+        QwenTransportError("simulated transport failure"),
+    ])
     result = start_session(_build(decider), _request("hello"), "t-transport-fail")
     assert result["final_result"]["status"] == "degraded"
-    assert "decision_provider_unavailable" in result["final_result"]["reason"]
+    assert len(decider.call_log) == 3
+
+
+def test_capability_classification_transport_failure_degrades_safely():
+    """Checkpoint Final Evaluation E.1S.1: a transport failure at the
+    CLASSIFICATION step itself (before any action decision is even
+    attempted) also degrades safely -- never a crash, never a silently
+    guessed scope."""
+    decider = ScriptedDecisionProvider([QwenTransportError("simulated transport failure")])
+    result = start_session(_build(decider), _request("hello"), "t-classification-transport-fail")
+    assert result["final_result"]["status"] == "degraded"
+    assert result["final_result"]["reason"] == "capability_classification_failed"
 
 
 def test_tool_timeout_produces_a_partial_result():
     tools = FakeToolExecutor(scenario_by_action={Action.SEARCH_FLIGHTS: "timeout"})
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -290,6 +365,7 @@ def test_rate_limiting_does_not_create_an_infinite_loop():
     tools = FakeToolExecutor(scenario_by_action={Action.SEARCH_FLIGHTS: "rate_limited"})
     same_args = {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("search_flights", same_args),
         _decision("search_flights", same_args),  # identical -- breaks the specialist loop, never re-executed
@@ -304,6 +380,7 @@ def test_rate_limiting_does_not_create_an_infinite_loop():
 def test_malformed_tool_output_is_rejected_not_inserted_as_valid():
     tools = FakeToolExecutor(scenario_by_action={Action.SEARCH_FLIGHTS: "malformed"})
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -345,6 +422,7 @@ def test_maximum_eight_tool_calls_enforced():
         "repair_count": 0,
         "consecutive_duplicate_count": 0,
         "normalized_request": {"user_message": "weather please"},
+        "capability_plan": _seeded_capability_plan("weather please", None, "travel_only"),
     }
     updates = decide(state)
     pending = updates["pending_action"]
@@ -376,12 +454,33 @@ def test_per_tool_call_cap_of_two_is_enforced_independently_of_the_total_cap():
         "repair_count": 0,
         "consecutive_duplicate_count": 0,
         "normalized_request": {"user_message": "weather please"},
+        # istanbul_local_only: call_istanbul_expert is otherwise eligible
+        # (not yet terminal this turn) -- proves the per-tool cap's own
+        # forced synthesize downgrade is never re-rejected by the new
+        # eligibility gate as if it were a hallucinated choice.
+        "capability_plan": _seeded_capability_plan("weather please", None, "istanbul_local_only", "requires_istanbul_local_grounding"),
     }
     updates = decide(state)
     assert updates["pending_action"]["action"] == "synthesize"
 
 
-def test_maximum_25_graph_transitions_enforced_by_recursion_limit():
+def test_maximum_25_graph_transitions_enforced_by_recursion_limit(monkeypatch):
+    """Checkpoint Final Evaluation E.1S.1: the new eligibility-then-one-
+    correction-then-degrade safety net now terminates a non-cooperative
+    decision provider FAR before 25 real transitions (a strictly safer
+    outcome than before this checkpoint -- `InfiniteCallTravelSearchProvider`
+    gets its repeated `call_travel_search` proposal rejected as ineligible
+    once Travel Search is already terminal for the turn, then degrades
+    after exactly one failed correction, never looping to the ceiling).
+    Proven instead the same way `phase4.specialist`'s own recursion limit
+    is proven (`test_production_specialist_wrapper_recovers_cleanly_from_
+    a_recursion_limit`): temporarily shrinking the real bound via
+    monkeypatch, confirming `start_session`'s own `GraphRecursionError`
+    catch still produces the same honest, schema-valid degraded result
+    for a provider that never voluntarily stops."""
+    import phase4.graph as graph_module
+
+    monkeypatch.setattr(graph_module, "MAX_GRAPH_TRANSITIONS", 3)
     decider = InfiniteCallTravelSearchProvider()
     result = start_session(_build(decider), _request("weather please"), "t-max-transitions")
     assert result["final_result"]["status"] == "degraded"
@@ -430,7 +529,10 @@ def test_no_raw_chain_of_thought_anywhere_in_state_trace_or_output():
 
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
+        _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, explanation="Weather needed."),
+        _decision("travel_search_complete", {}, "all_required_evidence_present"),
         _decision("synthesize", {}, "all_required_evidence_present"),
     ])
     result = start_session(_build(decider, tools), _request("weather please"), "t-no-cot")
@@ -438,14 +540,21 @@ def test_no_raw_chain_of_thought_anywhere_in_state_trace_or_output():
     for forbidden in ("chain-of-thought", "chain_of_thought", "step 1:", "let me think"):
         assert forbidden not in serialized
     for entry in result["trace"]:
-        assert set(entry.keys()).issubset({"node", "status", "action", "reason_code", "repair_attempts", "safe_error", "resumed", "reason"})
+        assert set(entry.keys()).issubset({
+            "node", "status", "action", "reason_code", "repair_attempts", "safe_error", "resumed", "reason",
+            "scope", "scope_source", "attempt", "status_code", "transient", "eligible_actions",
+            "specialist_status", "specialist_actions", "specialist_transitions",
+        })
 
 
 def test_deterministic_identical_input_behavior_with_the_fake_decision_provider():
     def _run(thread_id):
         tools = FakeToolExecutor()
         decider = ScriptedDecisionProvider([
+            _classification("travel_only"),
+            _decision("call_travel_search", {}, "missing_weather_info"),
             _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, explanation="Weather needed."),
+            _decision("travel_search_complete", {}, "all_required_evidence_present"),
             _decision("synthesize", {}, "all_required_evidence_present", explanation="Done."),
         ])
         graph = _build(decider, tools)
@@ -468,7 +577,10 @@ def test_final_output_validates_against_existing_output_guard():
 
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
+        _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}),
+        _decision("travel_search_complete", {}, "all_required_evidence_present"),
         _decision("synthesize", {}, "all_required_evidence_present"),
     ])
     result = start_session(_build(decider, tools), _request("weather please"), "t-output-guard")
@@ -482,6 +594,7 @@ def test_no_real_network_in_hermetic_tests(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", _forbidden)
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -498,6 +611,7 @@ def test_checkpointer_persists_state_for_the_thread():
     checkpointer = MemorySaver()
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -512,16 +626,24 @@ def test_checkpointer_persists_state_for_the_thread():
 
 
 def test_node_sequence_is_inspectable_from_trace():
-    decider = ScriptedDecisionProvider([_decision("synthesize", {}, "all_required_evidence_present")])
+    decider = ScriptedDecisionProvider([
+        _classification("clarification_required", "insufficient_information"),
+        _decision("ask_clarification", {"missing_fields": ["destination"], "question": "Which city?"}, "missing_essential_input"),
+    ])
     result = start_session(_build(decider), _request("hello"), "t-sequence")
     nodes = [t["node"] for t in result["trace"]]
-    assert nodes == ["InputGuard", "LoadSession", "Decide", "Synthesize", "End"]
+    # One extra "Decide" entry vs. the pre-E.1S.1 sequence -- still ONE
+    # physical Decide node execution, but it now logs two logical stages
+    # (capability classification, then the action decision) the same way
+    # Observe already logs its own folded-in "Update" stage.
+    assert nodes == ["InputGuard", "LoadSession", "Decide", "Decide", "Synthesize", "End"]
 
 
 def test_resumed_session_does_not_repeat_completed_actions():
     checkpointer = MemorySaver()
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
         _decision("travel_search_complete", {}, "all_required_evidence_present"),
@@ -540,7 +662,13 @@ def test_resumed_session_does_not_repeat_completed_actions():
     # against the resumed checkpoint's own `executed_fingerprints` and
     # breaks immediately, never re-executing it (see
     # `test_specialist_duplicate_call_breaks_the_delegation_loop_without_re_executing`
-    # for a direct, single-session proof of this same mechanic).
+    # for a direct, single-session proof of this same mechanic). The
+    # follow-up message is a genuinely NEW turn (a changed
+    # request_signature), so it gets its own fresh classification call
+    # too (Checkpoint Final Evaluation E.1S.1 §2) -- the resumed scope is
+    # still travel_only, but travel_search is no longer terminal for
+    # THIS new signature, legitimately re-opening eligibility.
+    decider.responses.append(_classification("travel_only"))
     decider.responses.append(_decision("call_travel_search", {}, "missing_weather_info"))
     decider.responses.append(
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info")
@@ -579,6 +707,7 @@ def test_specialist_shares_the_external_tool_call_budget_with_the_supervisor():
 def test_no_chain_of_thought_leaks_through_a_delegated_specialist_run():
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_weather_info", explanation="Weather and flight information are required."),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info", explanation="Checking the forecast."),
         _decision("travel_search_complete", {}, "all_required_evidence_present", explanation="Travel-search evidence gathered."),
@@ -716,47 +845,98 @@ def test_specialist_external_call_limit_of_five_fires_before_the_shared_eight_ca
     assert provider.calls == 5
 
 
-def test_global_eight_call_budget_is_shared_and_cannot_be_reset_by_a_second_delegation():
-    """Checkpoint Phase 4 D.3 correction pass: proves the shared
-    `MAX_EXTERNAL_TOOL_CALLS=8` budget is genuinely one counter across
-    BOTH loops and BOTH delegations -- a first delegation consumes 5
-    (its own cap), the supervisor's own direct `call_istanbul_expert`
-    call consumes a 6th, and a SECOND delegation is only ever allowed to
-    consume the 2 calls remaining (7, 8) before the shared ceiling stops
-    it -- never resetting to a fresh 5-call or 8-call allowance just
-    because a new delegation started."""
+def test_shared_eight_call_budget_persists_across_a_new_turn_and_is_never_reset():
+    """Checkpoint Final Evaluation E.1S.1 correction: proves the shared
+    `MAX_EXTERNAL_TOOL_CALLS=8` budget is a genuinely global counter that
+    survives across turns -- seeded directly (Checkpoint D.0's own
+    established pattern for exercising a rare boundary condition without
+    driving 8 real tool calls through the full graph), rather than
+    replayed through two SAME-turn delegations, which the new
+    capability-scope eligibility layer now correctly forbids (see
+    `test_identical_same_turn_travel_search_redelegation_is_rejected`
+    below). A brand-NEW turn (a fresh capability_plan/signature, scope
+    combined, travel_search not yet attempted for THIS turn) would
+    otherwise make `call_travel_search` freshly eligible -- but the
+    carried-over `tool_call_count=8` from earlier work still forces a
+    synthesize, proving the counter itself was never reset just because
+    the turn/signature changed."""
+    decide = _make_decide_node(
+        decision_provider=ScriptedDecisionProvider([_decision("call_travel_search", {}, "missing_flight_info")]),
+        cancellation_check=lambda: False, monotonic_clock=lambda: 0.0,
+    )
+    state: PlannerState = {
+        "started_at_monotonic": 0.0, "tool_call_count": 8, "tool_call_count_by_action": {},
+        "executed_fingerprints": [], "observations": [], "trace": [], "graph_transition_count": 10,
+        "repair_count": 0, "consecutive_duplicate_count": 0,
+        "normalized_request": {"user_message": "Plan my Istanbul trip (new turn)", "trip_request": VALID_TRIP_REQUEST},
+        "capability_plan": _seeded_capability_plan(
+            "Plan my Istanbul trip (new turn)", VALID_TRIP_REQUEST, "combined", "requires_both",
+        ),
+    }
+    updates = decide(state)
+    assert updates["pending_action"]["action"] == "synthesize"
+    assert updates["pending_action"]["reason_code"] == "bound_reached"
+
+
+def test_identical_same_turn_travel_search_redelegation_is_rejected():
+    """Checkpoint Final Evaluation E.1S.1 §4/§6: once Travel Search has
+    reached a terminal result for THIS turn's own capability-scope
+    signature, a second `call_travel_search` proposal within the SAME
+    turn is structurally ineligible -- rejected by the post-decision
+    gate and corrected, never silently re-executed (this is the
+    structural fix for the E.1R `H-S18` failure pattern)."""
     tools = FakeToolExecutor()
     decider = ScriptedDecisionProvider([
-        # --- first delegation: exhausts its own 5-call specialist cap ---
+        _classification("travel_only"),
         _decision("call_travel_search", {}, "missing_flight_info"),
         _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
-        _decision("web_search", {"query": "Hagia Sophia hours"}, "missing_current_info"),
-        _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-10", "passenger_count": 1}),
-        _decision("search_stays", {"check_in": "2026-09-10", "check_out": "2026-09-15", "guest_count": 1}, "missing_stay_info"),
-        _decision("estimate_fair_price", {"stay_id": "stay_fake_001"}, "needs_fair_price"),
-        # --- supervisor's own direct tool call: the 6th external call ---
-        _decision("call_istanbul_expert", {"question": "What should I see?"}, "missing_local_expertise"),
-        # --- second delegation: only 2 of the shared budget remain ---
-        _decision("call_travel_search", {}, "missing_weather_info"),
-        _decision("get_weather", {"location": "Ankara", "date_from": "2026-09-11", "date_to": "2026-09-11"}, "missing_weather_info"),
-        _decision("web_search", {"query": "Blue Mosque hours"}, "missing_current_info"),
+        _decision("travel_search_complete", {}, "all_required_evidence_present"),
+        _decision("call_travel_search", {}, "missing_flight_info"),  # ineligible: already terminal this turn
+        _decision("synthesize", {}, "all_required_evidence_present"),  # the one bounded correction
+    ])
+    result = start_session(_build(decider, tools), _request("weather please"), "t-same-turn-redelegation")
+    assert len(tools.call_log) == 1  # the second delegation never actually ran
+    rejected = [t for t in result["trace"] if t.get("status") == "action_ineligible_rejected"]
+    assert rejected and rejected[0]["action"] == "call_travel_search"
+    assert result["final_result"]["status"] == "success"
+
+
+def test_new_turn_with_changed_request_signature_legitimately_reopens_eligibility():
+    """Checkpoint Final Evaluation E.1S.1 §4/§6: unlike the identical
+    same-turn repeat above, a genuine follow-up turn (a different
+    `user_message`, hence a different `request_signature` and a fresh
+    capability_plan) legitimately re-opens `call_travel_search`
+    eligibility -- proven directly via `resume_session`, mirroring
+    `test_resumed_session_does_not_repeat_completed_actions` but
+    asserting on the classification/eligibility trace specifically."""
+    checkpointer = MemorySaver()
+    tools = FakeToolExecutor()
+    decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
+        _decision("call_travel_search", {}, "missing_flight_info"),
+        _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
+        _decision("travel_search_complete", {}, "all_required_evidence_present"),
         _decision("synthesize", {}, "all_required_evidence_present"),
     ])
-    result = start_session(_build(decider, tools), _request("Plan my Istanbul trip", VALID_TRIP_REQUEST), "t-shared-budget")
+    graph = _build(decider, tools, checkpointer=checkpointer)
+    first = start_session(graph, _request("weather please"), "t-new-turn-reopens")
+    assert first["final_result"]["status"] == "success"
 
-    assert result["tool_call_count"] == 8  # never exceeds the shared ceiling
-    actions = [obs["action"] for obs in result["observations"]]
-    assert actions.count("call_istanbul_expert") == 1
-    # exactly 2 real calls landed in the second delegation (7th, 8th) --
-    # the specialist's own next decide iteration detects the shared cap
-    # BEFORE asking for a 3rd decision within that delegation (never
-    # consumed); the supervisor's OWN following decide still calls the
-    # decision provider once more (its bound check runs AFTER, not
-    # before, asking -- unlike the specialist's own pre-check), landing
-    # on the scripted "synthesize" the shared cap would have forced
-    # anyway. All 11 scripted responses are consumed, nothing extra.
-    assert len(decider.call_log) == 11
-    assert result["final_result"]["status"] == "success"
+    decider.responses.append(_classification("travel_only"))
+    decider.responses.append(_decision("call_travel_search", {}, "missing_flight_info"))
+    decider.responses.append(
+        _decision("search_flights", {"origin": "BEY", "destination": "IST", "depart_date": "2026-09-11", "passenger_count": 1})
+    )
+    decider.responses.append(_decision("travel_search_complete", {}, "all_required_evidence_present"))
+    decider.responses.append(_decision("synthesize", {}, "all_required_evidence_present"))
+    second = resume_session(graph, "t-new-turn-reopens", user_message="now also find me a flight")
+
+    # A genuinely NEW real tool call landed (search_flights) -- proving
+    # the new turn's own call_travel_search delegation was accepted, not
+    # rejected as an ineligible repeat.
+    assert any(obs["action"] == "search_flights" for obs in second["observations"])
+    rejected = [t for t in second["trace"] if t.get("status") == "action_ineligible_rejected"]
+    assert not rejected
 
 
 def test_cancellation_propagates_into_the_specialist_graph():
@@ -816,7 +996,10 @@ def test_deadline_propagates_into_the_specialist_graph():
 def test_no_secret_or_prompt_persisted_in_checkpoint():
     checkpointer = MemorySaver()
     tools = FakeToolExecutor()
-    decider = ScriptedDecisionProvider([_decision("synthesize", {}, "all_required_evidence_present")])
+    decider = ScriptedDecisionProvider([
+        _classification("clarification_required", "insufficient_information"),
+        _decision("ask_clarification", {"missing_fields": ["destination"], "question": "Which city?"}, "missing_essential_input"),
+    ])
     graph = _build(decider, tools, checkpointer=checkpointer)
     start_session(graph, _request("hello"), "t-checkpoint-privacy")
     config = {"configurable": {"thread_id": "t-checkpoint-privacy"}}

@@ -150,6 +150,94 @@ class ReasonCode(str, Enum):
     INPUT_REJECTED = "input_rejected"
 
 
+# --- typed per-turn capability plan (Checkpoint Final Evaluation E.1S.1) -----------
+#
+# Explicitly represents what evidence a request actually needs, classified
+# once per new user turn (never re-derived from a language-specific
+# keyword list) so the supervisor's action-eligibility computation has a
+# real structural fact to gate on instead of inferring scope ad hoc from
+# `trip_request is None`/persistent attempt flags, as the prior Checkpoint
+# E.1S mechanism did.
+
+
+class CapabilityScope(str, Enum):
+    TRAVEL_ONLY = "travel_only"
+    ISTANBUL_LOCAL_ONLY = "istanbul_local_only"
+    COMBINED = "combined"
+    CLARIFICATION_REQUIRED = "clarification_required"
+    OUT_OF_SCOPE = "out_of_scope"
+
+
+class CapabilityReasonCode(str, Enum):
+    """A fixed, closed vocabulary for the CLASSIFICATION step only --
+    deliberately separate from `ReasonCode` (which describes why an
+    ACTION was chosen, not why a REQUEST was scoped the way it was)."""
+
+    REQUIRES_TRAVEL_EVIDENCE = "requires_travel_evidence"
+    REQUIRES_ISTANBUL_LOCAL_GROUNDING = "requires_istanbul_local_grounding"
+    REQUIRES_BOTH = "requires_both"
+    INSUFFICIENT_INFORMATION = "insufficient_information"
+    OUTSIDE_PROJECT_SCOPE = "outside_project_scope"
+    CLASSIFICATION_FAILED = "classification_failed"
+    # Checkpoint Final Evaluation E.1W: reserved for the one specific
+    # failure-recovery path in `phase4.graph._classify_capability` where
+    # live classification itself failed (format-invalid or transport-
+    # exhausted) but a previous turn's successful scope exists to safely
+    # fall back to -- never used for a genuine model-produced
+    # classification, and never a guess at "combined" or any other scope
+    # the model was never actually asked to confirm.
+    FALLBACK_INHERITED_PREVIOUS_SCOPE = "fallback_inherited_previous_scope"
+
+
+class ScopeSource(str, Enum):
+    """Checkpoint Final Evaluation E.1W: closed provenance tag for how a
+    `CapabilityPlan.scope` value was actually obtained -- never free-form
+    reasoning, always one of these four. Set entirely by
+    `phase4.graph._classify_capability`, never by the model itself (the
+    model only ever returns `is_continuation`; this file's caller decides
+    the provenance label from that plus whether a previous scope existed)."""
+
+    EXPLICIT = "explicit"  # a previous scope existed, but this request explicitly names a different/narrower task
+    INHERITED = "inherited"  # a previous scope existed and this request is an elliptical continuation of it
+    CLASSIFIED = "classified"  # no previous scope existed -- an ordinary, fresh classification
+    FALLBACK = "fallback"  # live classification failed; either safely inherited or (with no prior state) degraded
+
+
+class CapabilityPlan(BaseModel):
+    """Stores only what invariant-checking eligibility needs: the scope
+    enum, a stable per-turn request signature (a hash, never the raw
+    message/trip_request itself), whether classification actually
+    succeeded, a compact closed reason code, and (Checkpoint E.1W) a
+    closed provenance tag -- never free-form reasoning, a raw prompt, or
+    a raw model response."""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: CapabilityScope
+    request_signature: str
+    classification_succeeded: bool
+    reason_code: CapabilityReasonCode
+    scope_source: ScopeSource
+
+
+class CapabilityClassificationResponse(BaseModel):
+    """Checkpoint Final Evaluation E.1W: the closed shape a live (or
+    fixture) classification call may ever produce -- `is_continuation`
+    defaults to `False` so every pre-E.1W response (real historical
+    artifacts, the unmodified `orchestration.system_a.
+    fixture_decision_provider` classification helper) remains valid
+    without change. `scope`/`reason_code` are still required even when
+    `is_continuation=True`, for schema simplicity; the caller
+    (`phase4.graph._classify_capability`) uses them only when NOT
+    continuing, and overrides `scope` with the previous turn's own scope
+    when it IS a continuation -- so a genuine continuation never depends
+    on the model re-guessing a scope it was not actually asked to verify."""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: CapabilityScope
+    reason_code: CapabilityReasonCode
+    is_continuation: bool = False
+
+
 # --- per-action argument schemas (closed; extra="forbid") --------------------------
 
 
