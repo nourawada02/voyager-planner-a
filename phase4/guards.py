@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import re
 from datetime import date as date_cls
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -21,11 +23,41 @@ from phase4.models import ReasonCode
 
 _MAX_MESSAGE_LENGTH = 2000
 
-# This project's own scope: Istanbul trip planning priced against a
-# TRY-first market (see providers/flights_serpapi.py's own
-# currency="TRY" default in the root superproject) -- USD/EUR accepted
-# as common traveler-budget currencies, nothing else.
-_SUPPORTED_CURRENCIES = frozenset({"TRY", "USD", "EUR"})
+# The one project-wide timezone "today" is resolved in for date validation
+# (Manual QA remediation Q.1) -- Istanbul, matching every other IST-timezone
+# precedent already in this codebase (providers/flights_serpapi.py's own
+# IATA->timezone map for IST/SAW). A request submitted late at night UTC
+# that is already tomorrow in Istanbul must see tomorrow as "today", and
+# vice versa -- never a bare UTC date, never the server host's local time.
+PROJECT_TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+
+def default_wall_clock() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def resolve_today(clock: Callable[[], datetime] = default_wall_clock) -> date_cls:
+    """Resolves 'today' as a calendar date in PROJECT_TIMEZONE from an
+    injectable clock -- never `date.today()` (server local time) and never
+    hardcoded. Every caller that needs "today" for date validation goes
+    through this one function, so a test can pin an exact instant and every
+    layer (API pre-check, graph InputGuard) agrees on the same "today"."""
+    now = clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(PROJECT_TIMEZONE).date()
+
+# Manual QA remediation Q.1: TRY and USD only (user correction pass §B --
+# supersedes the earlier TRY-only decision now that genuine FX conversion
+# exists: providers/fx_frankfurter.py, a real Frankfurter.app/ECB rate
+# source, Decimal-exact, cached, with full provenance -- see
+# providers/money.py). Travel MCP's accommodation results remain
+# contractually TRY-only (`contracts/SearchStaysResult.schema.json`, the
+# historical Airbnb-Turkey snapshot has no other currency) -- for a USD
+# trip, TRY prices are converted for DISPLAY using the run's one FX quote,
+# never re-requested from Travel MCP in a currency it cannot produce.
+# EUR remains unsupported: no EUR rate source was verified/wired.
+_SUPPORTED_CURRENCIES = frozenset({"TRY", "USD"})
 
 _INJECTION_PATTERNS = tuple(
     re.compile(p, re.IGNORECASE)
@@ -79,12 +111,17 @@ def _first_error_field(exc: ValidationError) -> str:
     return str(loc[0]) if loc else "unknown"
 
 
-def check_input(user_message: str, trip_request: Optional[dict[str, Any]]) -> InputGuardResult:
+def check_input(user_message: str, trip_request: Optional[dict[str, Any]], *, today: date_cls) -> InputGuardResult:
     """Format/safety checks only -- never a live network call, never an
     LLM. `trip_request`, when present, is validated against the exact,
     unmodified `phase1.models.TripRequest` (reused, not re-implemented);
     a validation failure there is translated into one of a small, fixed
-    set of safe_error strings, never the raw pydantic error text."""
+    set of safe_error strings, never the raw pydantic error text.
+
+    `today` is required and keyword-only (Manual QA remediation Q.1) --
+    every caller must resolve it explicitly via `resolve_today(clock)`
+    rather than this function silently reaching for wall-clock time, so
+    date validation is always deterministic and testable."""
     if len(user_message) > _MAX_MESSAGE_LENGTH:
         return InputGuardResult(accepted=False, reason_code=ReasonCode.INPUT_REJECTED, safe_error="excessive_text")
 
@@ -103,7 +140,7 @@ def check_input(user_message: str, trip_request: Optional[dict[str, Any]]) -> In
             safe_error, reason = _FIELD_REASON_MAP.get(field, ("invalid_trip_request", ReasonCode.INPUT_REJECTED))
             return InputGuardResult(accepted=False, reason_code=reason, safe_error=safe_error)
 
-        if trip.depart_date < date_cls.today():
+        if trip.depart_date < today:
             return InputGuardResult(
                 accepted=False, reason_code=ReasonCode.MISSING_ESSENTIAL_INPUT, safe_error="depart_date_in_past"
             )

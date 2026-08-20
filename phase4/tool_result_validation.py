@@ -28,12 +28,22 @@ def _first_error_field(exc: ValidationError) -> str:
 def _validate_weather_result(result: dict) -> Optional[str]:
     """Matches the REAL `providers.weather`/`providers.weather_openmeteo`
     WeatherResult contract: a "kind"-discriminated shape ("current_observation"
-    with a nested `observation.condition`, or "forecast" with
-    `forecast_days[i].condition") -- not a flat {"location","condition"}
-    shape. Checkpoint D.1 audit finding: the original D.0 check only
-    matched this checkpoint's own fake fixture, not the real provider's
-    actual shape; both the fixture (`phase4/tools.py`) and this check
-    were corrected together."""
+    with a nested `observation.condition`, "forecast" with
+    `forecast_days[i].condition`, "historical" with
+    `historical_climate_days[i].condition`, or "mixed" with both -- not a
+    flat {"location","condition"} shape. Checkpoint D.1 audit finding: the
+    original D.0 check only matched this checkpoint's own fake fixture,
+    not the real provider's actual shape; both the fixture
+    (`phase4/tools.py`) and this check were corrected together.
+    "historical"/"mixed" added in Manual QA remediation Q.1 (user
+    correction pass §C): a real live get_weather call for a future date
+    beyond the forecast horizon returns one of these two kinds with
+    status='success' -- this check previously only recognized
+    "current_observation"/"forecast", so every genuinely successful
+    historical/mixed weather result was demoted to 'provider_error' here,
+    caught only by this checkpoint's own extended live verification, not
+    by any earlier hermetic test (FakeToolExecutor's own fixture never
+    exercised this kind)."""
     if "location" not in result:
         return "missing_location"
     kind = result.get("kind")
@@ -45,6 +55,17 @@ def _validate_weather_result(result: dict) -> Optional[str]:
         days = result.get("forecast_days")
         if not isinstance(days, list) or not days or "condition" not in days[0]:
             return "missing_forecast_condition"
+    elif kind == "historical":
+        days = result.get("historical_climate_days")
+        if not isinstance(days, list) or not days or "condition" not in days[0]:
+            return "missing_historical_climate_condition"
+    elif kind == "mixed":
+        forecast_days = result.get("forecast_days")
+        historical_days = result.get("historical_climate_days")
+        if not isinstance(forecast_days, list) or not forecast_days or "condition" not in forecast_days[0]:
+            return "missing_forecast_condition"
+        if not isinstance(historical_days, list) or not historical_days or "condition" not in historical_days[0]:
+            return "missing_historical_climate_condition"
     else:
         return "missing_or_unknown_kind"
     return None

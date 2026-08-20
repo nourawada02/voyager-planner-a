@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import socket
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -22,6 +23,7 @@ from phase4.graph import (
     PlannerState,
     _compute_request_signature,
     _make_decide_node,
+    _observe_node,
     build_graph,
     resume_session,
     start_session,
@@ -111,13 +113,22 @@ def _request(message: str, trip_request: dict | None = None) -> PlannerRequest:
     return PlannerRequest(session_id=uuid4(), trace_id=uuid4(), user_message=message, trip_request=trip_request)
 
 
+# Fixed test "today" -- every hardcoded trip date in this file (earliest:
+# "2026-09-10") stays safely in the future relative to this pinned clock
+# forever, so these hermetic tests never rot as real wall-clock time
+# advances past those dates (Manual QA remediation Q.1's injectable-clock
+# fix to phase4/guards.py::resolve_today made this override possible).
+_TEST_WALL_CLOCK = lambda: datetime(2026, 8, 19, tzinfo=timezone.utc)
+
+
 def _build(
-    decider, tools=None, cancellation_check=lambda: False, monotonic_clock=None, checkpointer=None,
+    decider, tools=None, cancellation_check=lambda: False, monotonic_clock=None, wall_clock=None, checkpointer=None,
     specialist_decider=None, specialist_event_callback=None,
 ):
     kwargs = {}
     if monotonic_clock is not None:
         kwargs["monotonic_clock"] = monotonic_clock
+    kwargs["wall_clock"] = wall_clock or _TEST_WALL_CLOCK
     return build_graph(
         tools or FakeToolExecutor(), decider, specialist_decider or decider,
         cancellation_check=cancellation_check, checkpointer=checkpointer,
@@ -220,9 +231,63 @@ def test_malformed_trip_request_is_rejected_by_input_guard_before_any_decision_c
     decider = ScriptedDecisionProvider([])  # must never be called
     result = start_session(_build(decider), _request("Plan my trip to Ankara", bad_trip), "t-bad-trip")
     assert result["final_result"]["status"] == "degraded"
+    # Manual QA remediation Q.1: the specific InputGuard safe_error must
+    # reach the final result, never the generic literal "degraded" that
+    # _degrade_node fell back to before this fix (it read only
+    # pending_action, which InputGuard-rejected runs never set).
+    assert result["final_result"]["reason"] == "unsupported_destination"
     assert decider.call_log == []
     assert "InputGuard" in [t["node"] for t in result["trace"]]
     assert "Decide" not in [t["node"] for t in result["trace"]]
+
+
+def test_past_depart_date_is_rejected_by_input_guard_with_specific_reason_surfaced():
+    """Manual QA remediation Q.1: reproduces the manual-run observation of
+    a genuinely past departure date -- must be rejected before any
+    Decide/Qwen/provider call, with the specific safe_error (not the
+    generic "degraded") reaching the final result."""
+    past_trip = dict(VALID_TRIP_REQUEST)
+    past_trip["depart_date"] = "2020-01-01"
+    past_trip["return_date"] = "2020-01-05"
+    decider = ScriptedDecisionProvider([])  # must never be called
+    result = start_session(_build(decider), _request("Plan my trip", past_trip), "t-past-date")
+    assert result["final_result"]["status"] == "degraded"
+    assert result["final_result"]["reason"] == "depart_date_in_past"
+    assert result["final_result"]["observations"] == []
+    assert decider.call_log == []
+    assert "InputGuard" in [t["node"] for t in result["trace"]]
+    assert "Decide" not in [t["node"] for t in result["trace"]]
+
+
+def test_wall_clock_injection_moves_the_input_guard_date_boundary():
+    """Proves build_graph's wall_clock parameter genuinely drives
+    InputGuard's date validation -- a trip request that clears InputGuard
+    (Decide is consulted at all) under the fixed _TEST_WALL_CLOCK is
+    rejected before ever reaching Decide once an injected clock moves
+    "today" past its depart_date, with no change to the request itself."""
+    trip = dict(VALID_TRIP_REQUEST)
+    trip["depart_date"] = "2026-09-10"
+    trip["return_date"] = "2026-09-15"
+
+    accepted_decider = ScriptedDecisionProvider([
+        _classification("travel_only"),
+        _decision("call_travel_search", {}, "missing_weather_info"),
+        _decision("get_weather", {"location": "Istanbul", "date_from": "2026-09-10", "date_to": "2026-09-10"}, "missing_weather_info"),
+        _decision("travel_search_complete", {}, "all_required_evidence_present"),
+        _decision("synthesize", {}, "all_required_evidence_present"),
+    ])
+    accepted = start_session(_build(accepted_decider), _request("Plan my trip", trip), "t-clock-before")
+    assert accepted["final_result"]["status"] == "success"
+    assert accepted_decider.call_log != []
+
+    later_clock = lambda: datetime(2026, 9, 20, tzinfo=timezone.utc)
+    rejected_decider = ScriptedDecisionProvider([])  # must never be called
+    rejected = start_session(
+        _build(rejected_decider, wall_clock=later_clock), _request("Plan my trip", trip), "t-clock-after"
+    )
+    assert rejected["final_result"]["status"] == "degraded"
+    assert rejected["final_result"]["reason"] == "depart_date_in_past"
+    assert rejected_decider.call_log == []
 
 
 def test_duplicate_action_is_blocked_not_re_executed():
@@ -393,6 +458,102 @@ def test_malformed_tool_output_is_rejected_not_inserted_as_valid():
     assert any("malformed_tool_result" in w for w in result["warnings"])
 
 
+def test_degraded_weather_envelope_is_preserved_not_discarded():
+    """Manual QA remediation Q.1: a genuinely degraded-but-well-formed
+    weather envelope (e.g. forecast_not_yet_available, which carries a
+    real earliest_available_forecast_date) must reach the observation's
+    `envelope` field -- previously ANY non-success status discarded the
+    envelope entirely, losing the one piece of information the frontend
+    needs to show a precise explanation instead of a bare status code."""
+    weather_envelope = {
+        "schema_version": "1.2.0",
+        "status": "forecast_not_yet_available",
+        "provider": "open-meteo",
+        "capability": "weather",
+        "data_mode": "unavailable",
+        "result": {
+            "schema_version": "1.2.0",
+            "location": "Istanbul",
+            "timezone": "Europe/Istanbul",
+            "kind": "unavailable",
+            "units": {"temperature": "C", "wind_speed": "kmh", "precipitation": "mm"},
+            "forecast_days": [],
+            "missing_fields": ["forecast_days"],
+            "earliest_available_forecast_date": "2026-09-04",
+        },
+    }
+    state: PlannerState = {
+        "pending_action": {
+            "action": "get_weather",
+            "arguments": {"location": "Istanbul", "date_from": "2026-09-20", "date_to": "2026-09-23"},
+        },
+        "pending_raw_tool_result": {"status": "forecast_not_yet_available", "result": weather_envelope},
+        "trace": [],
+        "graph_transition_count": 0,
+        "observations": [],
+        "executed_fingerprints": [],
+        "warnings": [],
+    }
+    updates = _observe_node(state)
+    observation = updates["observations"][-1]
+    assert observation["status"] == "forecast_not_yet_available"
+    assert observation["envelope"] is not None
+    assert observation["envelope"]["result"]["earliest_available_forecast_date"] == "2026-09-04"
+
+
+def test_specialist_degraded_weather_envelope_is_preserved_not_discarded():
+    """Manual QA remediation Q.1: GET_WEATHER is specialist-owned
+    (Checkpoint D.3) -- production execution runs through
+    phase4.specialist's own execute/observe node, not the supervisor's, so
+    this mirrors test_degraded_weather_envelope_is_preserved_not_discarded
+    against the node that actually matters in production."""
+    from phase4.specialist import _make_specialist_execute_observe_node
+
+    weather_envelope = {
+        "schema_version": "1.2.0",
+        "status": "forecast_not_yet_available",
+        "provider": "open-meteo",
+        "capability": "weather",
+        "data_mode": "unavailable",
+        "result": {
+            "schema_version": "1.2.0",
+            "location": "Istanbul",
+            "timezone": "Europe/Istanbul",
+            "kind": "unavailable",
+            "units": {"temperature": "C", "wind_speed": "kmh", "precipitation": "mm"},
+            "forecast_days": [],
+            "missing_fields": ["forecast_days"],
+            "earliest_available_forecast_date": "2026-09-04",
+        },
+    }
+
+    class _StubExecutor:
+        def execute(self, action, arguments, context=None):
+            return {"status": "forecast_not_yet_available", "result": weather_envelope}
+
+    node = _make_specialist_execute_observe_node(_StubExecutor(), cancellation_check=lambda: False)
+    state = {
+        "pending_action": {
+            "action": "get_weather",
+            "arguments": {"location": "Istanbul", "date_from": "2026-09-20", "date_to": "2026-09-23"},
+        },
+        "graph_transition_count": 0,
+        "session_id": "s1",
+        "trace_id": "t1",
+        "normalized_request": {},
+        "inherited_observations": [],
+        "specialist_observations": [],
+        "started_at_monotonic": 0.0,
+        "tool_call_count_by_action": {},
+        "warnings": [],
+    }
+    updates = node(state)
+    observation = updates["specialist_observations"][-1]
+    assert observation["status"] == "forecast_not_yet_available"
+    assert observation["envelope"] is not None
+    assert observation["envelope"]["result"]["earliest_available_forecast_date"] == "2026-09-04"
+
+
 def test_maximum_eight_tool_calls_enforced():
     # A direct unit test of the Decide node's own bound-enforcement
     # logic, given a state that already recorded 8 completed tool calls
@@ -499,6 +660,136 @@ def test_60_second_deadline_forces_degrade():
     assert result["final_result"]["status"] == "degraded"
     assert result["final_result"]["reason"] == "workflow_deadline_exceeded"
     assert decider.call_log == []  # the deadline check fires before the decision provider is ever called
+
+
+class _MustNeverBeCalledDecisionProvider:
+    """Proves the deadline-finalization path makes NO Qwen call at all --
+    any call at all is a test failure, not just a wrong answer."""
+
+    call_log: list = []
+
+    def generate(self, system: str, user: str) -> str:
+        raise AssertionError("decision provider must never be called once the deadline has already been exceeded")
+
+
+def _base_decide_state(**overrides) -> PlannerState:
+    state: PlannerState = {
+        "session_id": "s1", "trace_id": "t1", "user_message": "Plan my trip",
+        "trip_request": None, "normalized_request": {"user_message": "Plan my trip", "trip_request": None},
+        "graph_transition_count": 3, "trace": [], "observations": [], "executed_fingerprints": [],
+        "tool_call_count": 0, "tool_call_count_by_action": {}, "repair_count": 0,
+        "consecutive_duplicate_count": 0, "warnings": [], "safe_errors": [],
+        "started_at_monotonic": 0.0,
+        "travel_search_attempted_signature": None, "istanbul_expert_attempted_signature": None,
+        "last_successful_capability_scope": None,
+    }
+    state.update(overrides)
+    return state
+
+
+def test_deadline_with_all_required_evidence_already_gathered_finalizes_via_synthesize():
+    """Required regression test: all required observations completed
+    just before the deadline -> completed (synthesize), not degraded.
+    Reproduces the exact live symptom: travel_only scope, the one
+    required call_travel_search delegation already terminal (its
+    specialist sub-loop already returned get_weather/search_flights
+    successes into `observations`), and the deadline crossed on the
+    NEXT supervisor Decide call -- which must finalize, never discard
+    the already-complete evidence."""
+    signature = _compute_request_signature(_base_decide_state())
+    state = _base_decide_state(
+        capability_plan={"request_signature": signature, "classification_succeeded": True, "scope": "travel_only"},
+        travel_search_attempted_signature=signature,
+        observations=[
+            {"action": "get_weather", "status": "success", "fingerprint": "fp1", "envelope": {"ok": True}, "warnings": []},
+        ],
+    )
+    node = _make_decide_node(_MustNeverBeCalledDecisionProvider(), cancellation_check=lambda: False, monotonic_clock=lambda: 9999.0)
+    updates = node(state)
+
+    pending = updates["pending_action"]
+    assert pending["action"] == "synthesize"
+    assert pending["reason_code"] == "all_required_evidence_present"
+    assert updates["trace"][-1]["status"] == "deadline_finalized_with_complete_evidence"
+
+
+def test_deadline_with_missing_required_evidence_still_degrades():
+    """Required regression test: required observations missing at the
+    deadline -> degraded. Same travel_only scope, but the required
+    call_travel_search delegation was never attempted for this
+    signature -- evidence gathering is genuinely incomplete, so the
+    existing honest degradation must still fire."""
+    signature = _compute_request_signature(_base_decide_state())
+    state = _base_decide_state(
+        capability_plan={"request_signature": signature, "classification_succeeded": True, "scope": "travel_only"},
+        travel_search_attempted_signature=None,  # never attempted -- genuinely incomplete
+    )
+    node = _make_decide_node(_MustNeverBeCalledDecisionProvider(), cancellation_check=lambda: False, monotonic_clock=lambda: 9999.0)
+    updates = node(state)
+
+    pending = updates["pending_action"]
+    assert pending["action"] == "degrade"
+    assert pending["arguments"]["reason"] == "workflow_deadline_exceeded"
+
+
+def test_deadline_with_no_capability_plan_yet_still_degrades():
+    """The original, still-covered case: the deadline is crossed before
+    any classification has ever run (no capability_plan at all) -- must
+    still degrade exactly as before this correction."""
+    node = _make_decide_node(_MustNeverBeCalledDecisionProvider(), cancellation_check=lambda: False, monotonic_clock=lambda: 9999.0)
+    updates = node(_base_decide_state())
+
+    assert updates["pending_action"]["action"] == "degrade"
+    assert updates["pending_action"]["arguments"]["reason"] == "workflow_deadline_exceeded"
+
+
+def test_deadline_finalization_never_calls_the_decision_provider():
+    """Explicit proof (beyond the AssertionError-on-call guard already
+    used above) that no Qwen call and no provider call happens on this
+    path -- it is a pure, local, deterministic decision."""
+    signature = _compute_request_signature(_base_decide_state())
+    state = _base_decide_state(
+        capability_plan={"request_signature": signature, "classification_succeeded": True, "scope": "istanbul_local_only"},
+        istanbul_expert_attempted_signature=signature,
+    )
+    node = _make_decide_node(_MustNeverBeCalledDecisionProvider(), cancellation_check=lambda: False, monotonic_clock=lambda: 9999.0)
+    updates = node(state)  # would raise AssertionError inside generate() if ever called
+    assert updates["pending_action"]["action"] == "synthesize"
+
+
+def test_cancellation_still_takes_precedence_over_deadline_finalization():
+    """Required regression test: iteration/cancellation guards remain
+    active. Cancellation is checked FIRST in Decide, before the deadline
+    (and therefore before the new evidence-complete finalization) is
+    ever consulted -- even a workflow with complete evidence and a
+    crossed deadline must still honor a cancellation request."""
+    signature = _compute_request_signature(_base_decide_state())
+    state = _base_decide_state(
+        capability_plan={"request_signature": signature, "classification_succeeded": True, "scope": "travel_only"},
+        travel_search_attempted_signature=signature,
+    )
+    node = _make_decide_node(_MustNeverBeCalledDecisionProvider(), cancellation_check=lambda: True, monotonic_clock=lambda: 9999.0)
+    updates = node(state)
+
+    pending = updates["pending_action"]
+    assert pending["action"] == "degrade"
+    assert pending["reason_code"] == "cancelled"
+    assert updates["cancelled"] is True
+
+
+def test_transition_limit_still_enforced_independent_of_deadline_finalization(monkeypatch):
+    """Required regression test: the graph_transition_count/recursion
+    ceiling is untouched by this correction -- proven the same way
+    test_recursion_limit_produces_honest_degraded_result already proves
+    it, confirming the new deadline-finalization branch adds no
+    transition-limit exemption of its own."""
+    import phase4.graph as graph_module
+
+    monkeypatch.setattr(graph_module, "MAX_GRAPH_TRANSITIONS", 3)
+    decider = InfiniteCallTravelSearchProvider()
+    result = start_session(_build(decider), _request("weather please"), "t-transition-limit-with-deadline-fix")
+    assert result["final_result"]["status"] == "degraded"
+    assert result["final_result"]["reason"] == "graph_transition_limit_reached"
 
 
 def test_cancellation_short_circuits_before_any_tool_call():

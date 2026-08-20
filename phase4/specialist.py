@@ -315,6 +315,18 @@ def _make_specialist_execute_observe_node(
                 warnings.append(f"malformed_tool_result:{action.value}:{validation_error}")
             else:
                 envelope_dict = candidate
+        elif action == Action.GET_WEATHER:
+            # Manual QA remediation Q.1: mirrors the identical fix in
+            # phase4/graph.py::_observe_node -- GET_WEATHER is a
+            # specialist-owned tool (Checkpoint D.3), so THIS is the node
+            # that actually runs for it in production, not the
+            # supervisor's own Observe. A degraded-but-well-formed weather
+            # envelope (e.g. forecast_not_yet_available, carrying a real
+            # earliest_available_forecast_date) was previously discarded
+            # entirely just because the call didn't succeed.
+            candidate = raw.get("result")
+            if isinstance(candidate, dict):
+                envelope_dict = candidate
 
         observation = {
             "action": action.value,

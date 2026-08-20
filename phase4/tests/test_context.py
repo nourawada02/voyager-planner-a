@@ -63,6 +63,50 @@ def test_weather_validation_accepts_real_forecast_shape():
     assert _validate_weather_result(result) is None
 
 
+def test_weather_validation_accepts_real_historical_climate_shape():
+    """Manual QA remediation Q.1 (user correction pass §C): a real
+    successful get_weather result for a future date beyond the forecast
+    horizon has kind='historical' -- this was previously rejected as
+    'missing_or_unknown_kind' and silently demoted to 'provider_error',
+    caught only by this checkpoint's own extended live verification."""
+    result = {
+        "location": "Istanbul",
+        "kind": "historical",
+        "forecast_days": [],
+        "historical_climate_days": [
+            {"date": "2026-10-15", "condition": "overcast", "avg_high": 20.5, "avg_low": 13.2, "years_sampled": [2023, 2024, 2025]},
+        ],
+    }
+    assert _validate_weather_result(result) is None
+
+
+def test_weather_validation_accepts_real_mixed_coverage_shape():
+    result = {
+        "location": "Istanbul",
+        "kind": "mixed",
+        "forecast_days": [{"date": "2026-09-01", "condition": "clear_sky", "high": 29, "low": 21}],
+        "historical_climate_days": [
+            {"date": "2026-09-10", "condition": "overcast", "avg_high": 26.0, "avg_low": 19.0, "years_sampled": [2023, 2024, 2025]},
+        ],
+    }
+    assert _validate_weather_result(result) is None
+
+
+def test_weather_validation_rejects_empty_historical_climate_days():
+    result = {"location": "Istanbul", "kind": "historical", "historical_climate_days": []}
+    assert _validate_weather_result(result) == "missing_historical_climate_condition"
+
+
+def test_weather_validation_rejects_mixed_missing_forecast_days():
+    result = {"location": "Istanbul", "kind": "mixed", "forecast_days": [], "historical_climate_days": [{"condition": "clear"}]}
+    assert _validate_weather_result(result) == "missing_forecast_condition"
+
+
+def test_weather_validation_rejects_mixed_missing_historical_days():
+    result = {"location": "Istanbul", "kind": "mixed", "forecast_days": [{"condition": "clear"}], "historical_climate_days": []}
+    assert _validate_weather_result(result) == "missing_historical_climate_condition"
+
+
 def test_weather_validation_rejects_the_old_flat_shape():
     """The original D.0 fixture shape ({"location", "condition"} flat)
     never matched the real provider contract -- this proves the fixed

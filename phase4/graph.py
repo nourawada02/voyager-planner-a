@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -34,7 +35,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from phase4.context import ExecutionContext
-from phase4.guards import check_input, check_output
+from phase4.guards import check_input, check_output, default_wall_clock, resolve_today
 from phase4.models import (
     MAX_CALLS_PER_TOOL,
     MAX_DECISION_REPAIRS,
@@ -603,25 +604,29 @@ def _build_decision_prompt(state: PlannerState) -> tuple[str, str]:
 # --- node factories (close over injected dependencies) -----------------------------
 
 
-def _input_guard_node(state: PlannerState) -> dict[str, Any]:
-    trace = list(state.get("trace", []))
-    transitions = state.get("graph_transition_count", 0) + 1
-    result = check_input(state.get("user_message", ""), state.get("trip_request"))
-    if not result.accepted:
-        trace.append({"node": "InputGuard", "status": "rejected", "safe_error": result.safe_error})
+def _make_input_guard_node(wall_clock: Callable[[], datetime]) -> Callable[[PlannerState], dict[str, Any]]:
+    def _input_guard_node(state: PlannerState) -> dict[str, Any]:
+        trace = list(state.get("trace", []))
+        transitions = state.get("graph_transition_count", 0) + 1
+        today = resolve_today(wall_clock)
+        result = check_input(state.get("user_message", ""), state.get("trip_request"), today=today)
+        if not result.accepted:
+            trace.append({"node": "InputGuard", "status": "rejected", "safe_error": result.safe_error})
+            return {
+                "graph_transition_count": transitions,
+                "trace": trace,
+                "rejected": True,
+                "safe_errors": state.get("safe_errors", []) + [result.safe_error or "input_rejected"],
+            }
+        trace.append({"node": "InputGuard", "status": "accepted"})
         return {
             "graph_transition_count": transitions,
             "trace": trace,
-            "rejected": True,
-            "safe_errors": state.get("safe_errors", []) + [result.safe_error or "input_rejected"],
+            "normalized_request": result.normalized_request,
+            "rejected": False,
         }
-    trace.append({"node": "InputGuard", "status": "accepted"})
-    return {
-        "graph_transition_count": transitions,
-        "trace": trace,
-        "normalized_request": result.normalized_request,
-        "rejected": False,
-    }
+
+    return _input_guard_node
 
 
 def _load_session_node(state: PlannerState) -> dict[str, Any]:
@@ -667,6 +672,47 @@ def _make_decide_node(
             started_at = monotonic_clock()
         elapsed = monotonic_clock() - started_at
         if elapsed >= TOTAL_WORKFLOW_DEADLINE_SECONDS:
+            # Final live reliability correction: a workflow that has
+            # ALREADY gathered every required piece of evidence for this
+            # turn must finalize via a genuine synthesize, never degrade
+            # solely because the 60s deadline was crossed while picking
+            # the next (already-obvious) action -- observed live: all
+            # four observations (flights/stays/weather/istanbul_expert)
+            # completed successfully, then the one remaining Decide call
+            # (which would have picked "synthesize") got discarded by
+            # this exact branch and replaced with a needless
+            # workflow_deadline_exceeded degrade.
+            #
+            # This makes NO Qwen call and NO provider call -- it reuses
+            # `compute_eligible_supervisor_actions`, the exact same pure,
+            # deterministic eligibility function every OTHER Decide
+            # outcome is already validated against, never a
+            # reimplementation. A genuinely incomplete workflow (a
+            # missing/stale capability_plan, or any eligible set other
+            # than exactly {synthesize} -- still-missing evidence,
+            # clarification needed, classification never completed)
+            # still degrades honestly below, exactly as before. The
+            # workflow remains hard-bounded either way: this trades one
+            # local, instant decision for the network/LLM round-trip a
+            # normal Decide call would have made, never adding a new
+            # tool call, transition-limit exemption, or unbounded loop.
+            request_signature = _compute_request_signature(state)
+            capability_plan = state.get("capability_plan")
+            evidence_complete = (
+                capability_plan is not None
+                and capability_plan.get("request_signature") == request_signature
+                and compute_eligible_supervisor_actions({**state, "capability_plan": capability_plan}) == frozenset({Action.SYNTHESIZE})
+            )
+            if evidence_complete:
+                decision = ActionDecision(action=Action.SYNTHESIZE, arguments={}, reason_code=ReasonCode.ALL_REQUIRED_EVIDENCE_PRESENT)
+                trace.append({
+                    "node": "Decide", "action": decision.action.value, "reason_code": decision.reason_code.value,
+                    "status": "deadline_finalized_with_complete_evidence",
+                })
+                return {
+                    "graph_transition_count": transitions, "trace": trace,
+                    "pending_action": decision.model_dump(mode="json"), "capability_plan": capability_plan,
+                }
             decision = ActionDecision(
                 action=Action.DEGRADE, arguments={"reason": "workflow_deadline_exceeded"}, reason_code=ReasonCode.BOUND_REACHED
             )
@@ -1034,6 +1080,20 @@ def _observe_node(state: PlannerState) -> dict[str, Any]:
             warnings.append(f"malformed_tool_result:{action.value}:{validation_error}")
         else:
             envelope_dict = candidate
+    elif action == Action.GET_WEATHER:
+        # Manual QA remediation Q.1: a degraded-but-well-formed weather
+        # envelope (e.g. status="forecast_not_yet_available", which
+        # carries a real, already schema-validated
+        # earliest_available_forecast_date) was previously discarded
+        # entirely just because the call didn't succeed, losing the one
+        # piece of information the caller/UI most needs to show a precise
+        # explanation instead of a bare status code. Scoped to GET_WEATHER
+        # only -- providers/weather_openmeteo.py's own _degraded_envelope
+        # already calls validate_envelope() before ever returning, so this
+        # is not raw/unvalidated internal detail.
+        candidate = raw.get("result")
+        if isinstance(candidate, dict):
+            envelope_dict = candidate
 
     observation = {
         "action": action.value,
@@ -1117,7 +1177,19 @@ def _degrade_node(state: PlannerState) -> dict[str, Any]:
     trace = list(state.get("trace", []))
     transitions = state.get("graph_transition_count", 0) + 1
     pending = state.get("pending_action") or {}
-    reason = pending.get("arguments", {}).get("reason") or pending.get("reason_code") or "degraded"
+    safe_errors = state.get("safe_errors", [])
+    # A run degraded via InputGuard rejection never has a `pending_action`
+    # (routing skips Decide entirely -- see _route_after_input_guard), so
+    # the specific safe_error InputGuard already computed (e.g.
+    # "depart_date_in_past") is the most informative reason available here;
+    # falling all the way through to the generic literal "degraded" silently
+    # discarded it (Manual QA remediation Q.1 root cause).
+    reason = (
+        pending.get("arguments", {}).get("reason")
+        or pending.get("reason_code")
+        or (safe_errors[-1] if safe_errors else None)
+        or "degraded"
+    )
     reason_str = str(reason)[:100]
     final_result = {
         "status": "degraded",
@@ -1167,6 +1239,7 @@ def build_graph(
     specialist_decision_provider: DecisionProvider,
     cancellation_check: Callable[[], bool] = lambda: False,
     monotonic_clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], datetime] = default_wall_clock,
     checkpointer: Optional[BaseCheckpointSaver] = None,
     specialist_event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> CompiledStateGraph:
@@ -1192,7 +1265,7 @@ def build_graph(
     )
 
     graph = StateGraph(PlannerState)
-    graph.add_node("input_guard", _input_guard_node)
+    graph.add_node("input_guard", _make_input_guard_node(wall_clock))
     graph.add_node("load_session", _load_session_node)
     graph.add_node("decide", _make_decide_node(decision_provider, cancellation_check, monotonic_clock))
     graph.add_node(
