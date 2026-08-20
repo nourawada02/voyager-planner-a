@@ -296,6 +296,26 @@ class AccessibilityScore(BaseModel):
     score: float = Field(ge=0, le=1)
 
 
+class CandidateProvenanceEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    poi_id: str = Field(pattern=r"^poi_[a-z0-9_]+$")
+    candidate_origin: str = Field(pattern=r"^(rag|catalog_fallback)$")
+    display_name: Optional[str] = Field(default=None, min_length=1)
+    matched_interests: Optional[list[str]] = None
+    source_id: Optional[str] = Field(default=None, min_length=1)
+    chunk_id: Optional[str] = Field(default=None, min_length=1)
+    retrieval_query: Optional[str] = Field(default=None, min_length=1)
+    retrieval_score: Optional[float] = None
+
+
+class AccessibilityEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    requested: bool
+    status: str = Field(pattern=r"^(satisfied|evidence_available_not_candidate_verified|unsupported)$")
+    evidence_count: int = Field(ge=0)
+    note: str = Field(min_length=1)
+
+
 class LocalItinerary(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: str = SCHEMA_VERSION
@@ -315,6 +335,9 @@ class LocalItinerary(BaseModel):
     warnings: list[str]
     data_quality: DataQuality
     hard_constraint_validation_passed: bool
+    candidate_provenance: Optional[list[CandidateProvenanceEntry]] = None
+    uncovered_interests: Optional[list[str]] = None
+    accessibility_evaluation: Optional[AccessibilityEvaluation] = None
 
 
 class FxSnapshot(BaseModel):
