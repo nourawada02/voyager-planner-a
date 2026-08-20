@@ -155,6 +155,10 @@ def _build_specialist_prompt(state: TravelSearchState) -> tuple[str, str]:
         "Always use IATA airport codes for any 'origin'/'destination'-shaped argument, never a "
         "city name -- for this project's scope, 'Beirut' means the IATA code BEY and "
         "'Istanbul' means the IATA code IST unless a different specific airport was named. "
+        "For estimate_fair_price, the 'stay_id' argument MUST be copied EXACTLY (character for "
+        "character) from one of 'known_stay_candidates' below -- never invented, never "
+        "paraphrased, never a hotel name in place of its id. If 'known_stay_candidates' is "
+        "empty, call search_stays first instead. "
         "One concrete valid example for a one-way Beirut-to-Istanbul flight request: "
         + example_json + ". "
         "Return only the single JSON object described above -- no markdown fencing, no "
@@ -162,12 +166,42 @@ def _build_specialist_prompt(state: TravelSearchState) -> tuple[str, str]:
         "reasoning process."
     )
     all_observations = state.get("inherited_observations", []) + state.get("specialist_observations", [])
-    evidence_summary = [{"action": obs["action"], "status": obs["status"]} for obs in all_observations]
+    evidence_summary = []
+    for obs in all_observations:
+        entry = {"action": obs["action"], "status": obs["status"]}
+        if obs.get("warnings"):
+            # Fair-price correction: an already-safe, already-caller-facing
+            # field (never raw internal exception detail) -- surfaced here
+            # so a bounded retry (MAX_CALLS_PER_TOOL) has an actual reason
+            # to react to, not just a bare repeated status string.
+            entry["warnings"] = obs["warnings"]
+        evidence_summary.append(entry)
+
+    # Fair-price correction root-cause fix: the real, already-returned
+    # stay_id values from the most recent successful search_stays
+    # observation -- previously never shown to the model at all, which
+    # left it no choice but to guess a stay_id for estimate_fair_price
+    # (silently rejected pre-MCP by orchestration.system_a.tool_executor's
+    # _validated_stay_id gate). Grounds the model in real data instead of
+    # asking it to invent one.
+    known_stay_candidates: list[dict[str, Any]] = []
+    for obs in reversed(all_observations):
+        if obs.get("action") != Action.SEARCH_STAYS.value or obs.get("status") != "success":
+            continue
+        envelope = obs.get("envelope") or {}
+        for item in envelope.get("stays", []) or []:
+            stay = item.get("stay") or {}
+            if stay.get("stay_id"):
+                known_stay_candidates.append({"stay_id": stay["stay_id"], "name": stay.get("name")})
+        if known_stay_candidates:
+            break  # most recent successful search_stays observation only
+
     total_used = state.get("tool_call_count", 0)
     user_payload = {
         "user_message": state.get("normalized_request", {}).get("user_message", ""),
         "trip_request": state.get("normalized_request", {}).get("trip_request"),
         "evidence_collected_so_far": evidence_summary,
+        "known_stay_candidates": known_stay_candidates,
         "tool_calls_used": total_used,
         "tool_calls_remaining": MAX_EXTERNAL_TOOL_CALLS - total_used,
     }
@@ -328,12 +362,17 @@ def _make_specialist_execute_observe_node(
             if isinstance(candidate, dict):
                 envelope_dict = candidate
 
+        observation_warnings: list[str] = []
+        if envelope_dict is None:
+            reason = raw.get("reason")  # additive, internal-only field (orchestration.system_a.tool_executor)
+            observation_warnings.append(f"status={status}:{reason}" if reason else f"status={status}")
+
         observation = {
             "action": action.value,
             "status": status,
             "fingerprint": fingerprint,
             "envelope": envelope_dict,
-            "warnings": [] if envelope_dict is not None else [f"status={status}"],
+            "warnings": observation_warnings,
         }
 
         by_action = dict(state.get("tool_call_count_by_action", {}))
