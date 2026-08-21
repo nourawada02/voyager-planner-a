@@ -26,6 +26,12 @@ class DataMode(str, Enum):
     HISTORICAL = "historical"
     FIXTURE = "fixture"
     ESTIMATED = "estimated"
+    # Checkpoint Phase 4 D.1 additive value: matches the root
+    # ProviderResponseEnvelope.schema.json 1.1.0 correction pass
+    # (docs/adr/0009-...md) exactly -- "no data and no computed estimate
+    # exist at all", distinct from ESTIMATED. Every pre-existing document
+    # using only the original five values remains valid unchanged.
+    UNAVAILABLE = "unavailable"
 
 
 class Pace(str, Enum):
@@ -90,11 +96,28 @@ class ErrorEnvelope(BaseModel):
 
 
 class ProviderResponseEnvelope(BaseModel):
+    """Checkpoint Phase 4 D.1 additive change: `capability`, `status`,
+    `query_fingerprint`, `cache_status`, and `cache_age_seconds` mirror
+    the root ProviderResponseEnvelope.schema.json's own 1.1.0 additive
+    fields exactly (docs/adr/0009-phase4-checkpointc0-live-data-and-react-design.md)
+    -- required because every real root provider adapter (Open-Meteo,
+    SerpApi web evidence, SerpApi Google Flights) has produced 1.1.0
+    envelopes since Checkpoint C.0/C.1, and this mirror previously only
+    had the original 1.0.0 fields, so it would have rejected every real
+    envelope outright. All five are optional, so every pre-existing
+    1.0.0-only instance/fixture remains valid unchanged -- the same
+    additive-minor-version discipline the root schema itself follows."""
+
     model_config = ConfigDict(extra="forbid")
     schema_version: str = SCHEMA_VERSION
     request_id: UUID
     provider: str = Field(min_length=1)
+    capability: Optional[str] = Field(default=None, pattern=r"^[a-z][a-z0-9_]*$")
     data_mode: DataMode
+    status: Optional[str] = None
+    query_fingerprint: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    cache_status: Optional[str] = None
+    cache_age_seconds: Optional[int] = Field(default=None, ge=0)
     retrieved_at: datetime
     valid_for: Optional[str] = None
     currency: Optional[str] = Field(default=None, pattern=r"^[A-Z]{3}$")
@@ -126,7 +149,28 @@ class TripRequest(BaseModel):
     preferences: TripPreferences
 
 
+class FlightLeg(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    origin: str = Field(pattern=r"^[A-Z]{3}$")
+    destination: str = Field(pattern=r"^[A-Z]{3}$")
+    depart_at: datetime
+    arrive_at: datetime
+    carrier: str = Field(min_length=1)
+    flight_number: Optional[str] = Field(default=None, pattern=r"^[A-Z0-9]{2,3}[0-9]{1,4}[A-Z]?$")
+
+
 class FlightOption(BaseModel):
+    """Checkpoint Phase 4 D.1 additive change: `flight_number`,
+    `duration_minutes`, `legs`, `provider_reference`, `offer_expires_at`,
+    `baggage_limitations`, and `fare_limitations` mirror the root
+    FlightOption.schema.json's own 1.1.0 additive fields exactly
+    (docs/adr/0009-...md) -- required because the real
+    `providers.flights_serpapi` adapter (Checkpoint C.3) has produced
+    1.1.0 options since that checkpoint, and this mirror previously only
+    had the original 1.0.0 fields, so it would have rejected every real
+    flight option outright. All seven are optional, so every
+    pre-existing 1.0.0-only instance/fixture remains valid unchanged."""
+
     model_config = ConfigDict(extra="forbid")
     schema_version: str = SCHEMA_VERSION
     flight_id: str = Field(min_length=1)
@@ -135,8 +179,15 @@ class FlightOption(BaseModel):
     depart_at: datetime
     arrive_at: datetime
     carrier: str = Field(min_length=1)
+    flight_number: Optional[str] = Field(default=None, pattern=r"^[A-Z0-9]{2,3}[0-9]{1,4}[A-Z]?$")
     stops: int = Field(ge=0)
+    duration_minutes: Optional[int] = Field(default=None, ge=0)
+    legs: Optional[list[FlightLeg]] = Field(default=None, min_length=2)
     price: Money
+    provider_reference: Optional[str] = Field(default=None, min_length=1)
+    offer_expires_at: Optional[datetime] = None
+    baggage_limitations: Optional[str] = Field(default=None, max_length=512)
+    fare_limitations: Optional[str] = Field(default=None, max_length=512)
     provenance: DataProvenance
 
 
@@ -245,6 +296,26 @@ class AccessibilityScore(BaseModel):
     score: float = Field(ge=0, le=1)
 
 
+class CandidateProvenanceEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    poi_id: str = Field(pattern=r"^poi_[a-z0-9_]+$")
+    candidate_origin: str = Field(pattern=r"^(rag|catalog_fallback)$")
+    display_name: Optional[str] = Field(default=None, min_length=1)
+    matched_interests: Optional[list[str]] = None
+    source_id: Optional[str] = Field(default=None, min_length=1)
+    chunk_id: Optional[str] = Field(default=None, min_length=1)
+    retrieval_query: Optional[str] = Field(default=None, min_length=1)
+    retrieval_score: Optional[float] = None
+
+
+class AccessibilityEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    requested: bool
+    status: str = Field(pattern=r"^(satisfied|evidence_available_not_candidate_verified|unsupported)$")
+    evidence_count: int = Field(ge=0)
+    note: str = Field(min_length=1)
+
+
 class LocalItinerary(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: str = SCHEMA_VERSION
@@ -264,6 +335,9 @@ class LocalItinerary(BaseModel):
     warnings: list[str]
     data_quality: DataQuality
     hard_constraint_validation_passed: bool
+    candidate_provenance: Optional[list[CandidateProvenanceEntry]] = None
+    uncovered_interests: Optional[list[str]] = None
+    accessibility_evaluation: Optional[AccessibilityEvaluation] = None
 
 
 class FxSnapshot(BaseModel):
@@ -346,6 +420,22 @@ class StreamStage(str, Enum):
     PARTIAL_FAILURE = "partial_failure"
     PLAN_COMPLETED = "plan.completed"
     ERROR = "error"
+    # Checkpoint Phase 4 D.2A additive values (contracts/StreamEvent.schema.json
+    # 1.1.0): the original ten values above describe architecture.md
+    # §5.3's linear pipeline; System A's real shape since Checkpoint D.0
+    # is the bounded ReAct action loop (ADR 0009 §4), which this
+    # checkpoint's public SSE endpoint streams sanitized progress for
+    # instead. Purely additive -- every pre-existing 1.0.0 StreamEvent
+    # instance using only the original ten values remains valid
+    # unchanged (docs/adr/0015-phase4-checkpoint-d2a-system-a-api.md).
+    RUN_STARTED = "run_started"
+    ACTION_STARTED = "action_started"
+    ACTION_COMPLETED = "action_completed"
+    ACTION_FAILED = "action_failed"
+    RUN_COMPLETED = "run_completed"
+    RUN_DEGRADED = "run_degraded"
+    RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
 
 
 class StreamEvent(BaseModel):
